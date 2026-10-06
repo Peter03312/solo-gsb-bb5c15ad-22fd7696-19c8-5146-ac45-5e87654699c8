@@ -1,0 +1,185 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>事故复盘时间线</title>
+<link rel="stylesheet" href="/static/style.css">
+</head>
+<body>
+<header>
+  <h1>事故复盘时间线</h1>
+  <div class="review-picker">
+    <select id="review-select"></select>
+    <button id="btn-new">新建复盘</button>
+    <button id="btn-delete" class="danger">删除</button>
+    <button id="btn-refresh" title="从服务器重新加载">刷新</button>
+  </div>
+</header>
+
+<div id="banner" class="banner hidden"></div>
+
+<main id="main" class="hidden">
+  <section class="panel">
+    <div class="review-head">
+      <input id="review-title" type="text" placeholder="复盘标题">
+      <span id="version-badge" class="badge"></span>
+      <span id="status-badge" class="badge"></span>
+      <button id="btn-finalize">定稿</button>
+      <button id="btn-save" class="primary">保存并重新推算</button>
+    </div>
+
+    <h2>事件</h2>
+    <p class="hint">记录每个事件的起始时间范围与持续分钟数。缺少时间范围的事件将作为“暂存”保存，暂不参与推算。
+      跨地区事故可在「时区」列填写 IANA 时区（如 Asia/Shanghai、America/New_York，留空表示不指定时区）；
+      指定时区后，最早/最晚开始须填写<strong>带 UTC 偏移的当地时间</strong>（如 2026-11-01T01:30-05:00），
+      偏移须符合该时区当日夏令时规则，否则整次保存会被拒绝。带时区与未带时区的事件之间不能建立“先于”关系。</p>
+    <table id="events-table">
+      <thead>
+        <tr>
+          <th>事件名称</th><th>时区(IANA)</th><th>最早开始（当地+偏移）</th><th>最晚开始（当地+偏移）</th><th>持续(分钟)</th><th>备注</th><th></th>
+        </tr>
+      </thead>
+      <tbody></tbody>
+    </table>
+    <datalist id="tz-list">
+      <option value="UTC"></option>
+      <option value="Asia/Shanghai"></option>
+      <option value="Asia/Hong_Kong"></option>
+      <option value="Asia/Tokyo"></option>
+      <option value="Asia/Singapore"></option>
+      <option value="Asia/Dubai"></option>
+      <option value="Asia/Kolkata"></option>
+      <option value="Asia/Bangkok"></option>
+      <option value="Asia/Seoul"></option>
+      <option value="Europe/London"></option>
+      <option value="Europe/Berlin"></option>
+      <option value="Europe/Paris"></option>
+      <option value="Europe/Moscow"></option>
+      <option value="America/New_York"></option>
+      <option value="America/Chicago"></option>
+      <option value="America/Denver"></option>
+      <option value="America/Los_Angeles"></option>
+      <option value="America/Sao_Paulo"></option>
+      <option value="Australia/Sydney"></option>
+      <option value="Pacific/Auckland"></option>
+    </datalist>
+    <button id="btn-add-event">+ 添加事件</button>
+
+    <h2>“先于”关系</h2>
+    <p class="hint">A 先于 B：A 结束到 B 开始的间隔可设最短/最长等待（非负整数分钟，最长可空 = 不限）。
+      即 A 结束 + 最短等待 ≤ B 开始 ≤ A 结束 + 最长等待；不设置时按旧语义 A 开始 + A 持续 ≤ B 开始 推算。</p>
+    <div class="relation-add">
+      <select id="rel-pre"></select>
+      <span>先于</span>
+      <select id="rel-suc"></select>
+      <label class="gap-field">最短等待 <input id="rel-min-gap" type="number" min="0" step="1" placeholder="0"> 分钟</label>
+      <label class="gap-field">最长等待 <input id="rel-max-gap" type="number" min="0" step="1" placeholder="可空"> 分钟</label>
+      <button id="btn-add-relation">+ 添加关系</button>
+    </div>
+    <ul id="relations-list" class="relations"></ul>
+  </section>
+
+  <section class="panel" id="results">
+    <h2>推算结果</h2>
+    <div id="result-summary"></div>
+    <div id="conflicts"></div>
+    <div id="drafts"></div>
+    <div id="skipped"></div>
+    <div id="windows"></div>
+  </section>
+
+  <section class="panel" id="history">
+    <div class="history-head">
+      <h2>历史版本（可回看 / 可恢复 / 可对照）</h2>
+      <button id="btn-reload-versions" title="重新加载版本列表">刷新版本</button>
+    </div>
+    <p class="hint">每次保存或定稿都会留存不可变的标题、事件与“先于”关系输入快照。恢复会把旧版本输入另存为当前复盘的新草稿版本并重新推算，不会覆盖任何旧版本。</p>
+
+    <div class="merge-bar">
+      <div class="merge-bar-head">
+        <strong>并入另一份复盘的历史事件链</strong>
+        <span class="hint">先预览（只读，不改任何版本），确认后一次性另存为当前复盘的新草稿版本。</span>
+      </div>
+      <div class="merge-fields">
+        <label>来源复盘 <select id="merge-review"></select></label>
+        <label>来源版本 <select id="merge-version"></select></label>
+        <button id="btn-merge-load">加载该版本事件</button>
+      </div>
+      <div id="merge-event-picker" class="merge-picker hidden"></div>
+    </div>
+
+    <div class="compare-bar">
+      <label>较早版本 <select id="compare-from"></select></label>
+      <label>较晚版本 <select id="compare-to"></select></label>
+      <button id="btn-compare">对照这两个版本</button>
+      <span class="hint">只读对照：按事件持续身份配对，不改当前输入与定稿状态。</span>
+    </div>
+    <table id="versions-table">
+      <thead>
+        <tr>
+          <th>版本</th><th>类型</th><th>推算状态</th><th>时间</th><th>操作</th>
+        </tr>
+      </thead>
+      <tbody></tbody>
+    </table>
+  </section>
+</main>
+
+<div id="compare-modal" class="modal-mask hidden">
+  <div class="modal">
+    <div class="modal-head">
+      <span id="cm-title" class="vm-title"></span>
+      <button id="btn-cm-close" title="关闭">✕</button>
+    </div>
+    <div id="cm-meta" class="hint"></div>
+    <div id="cm-body" class="modal-body"></div>
+  </div>
+</div>
+
+<div id="merge-modal" class="modal-mask hidden">
+  <div class="modal">
+    <div class="modal-head">
+      <span id="mm-title" class="vm-title"></span>
+      <button id="btn-mm-close" title="关闭">✕</button>
+    </div>
+    <div id="mm-meta" class="hint"></div>
+    <div id="mm-body" class="modal-body"></div>
+    <div class="modal-foot">
+      <span id="mm-note" class="hint"></span>
+      <button id="btn-mm-confirm" class="primary">确认并入，另存为新草稿版本</button>
+    </div>
+  </div>
+</div>
+
+<div id="version-modal" class="modal-mask hidden">
+  <div class="modal">
+    <div class="modal-head">
+      <span id="vm-title" class="vm-title"></span>
+      <span id="vm-badges"></span>
+      <button id="btn-vm-close" title="关闭">✕</button>
+    </div>
+    <div id="vm-meta" class="hint"></div>
+    <div id="vm-body" class="modal-body"></div>
+    <div class="modal-foot">
+      <button id="btn-vm-restore" class="primary">恢复为新草稿版本</button>
+    </div>
+  </div>
+</div>
+
+<div id="diagnosis-modal" class="modal-mask hidden">
+  <div class="modal">
+    <div class="modal-head">
+      <span id="dg-title" class="vm-title"></span>
+      <button id="btn-dg-close" title="关闭">✕</button>
+    </div>
+    <div id="dg-meta" class="hint"></div>
+    <div id="dg-body" class="modal-body"></div>
+  </div>
+</div>
+
+<div id="empty" class="empty">请选择或新建一个复盘开始协作。</div>
+
+<script src="/static/app.js"></script>
+</body>
+</html>
