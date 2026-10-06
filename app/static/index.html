@@ -66,6 +66,14 @@
     </datalist>
     <button id="btn-add-event">+ 添加事件</button>
 
+    <h2>证据附件（现场日志 / 截图 / PDF）</h2>
+    <p class="hint">可为<strong>已保存的事件</strong>上传文本（.txt/.log/.md/.csv/.json/.xml，UTF-8）、PNG、JPEG 或 PDF，
+      单个文件不超过 <strong>20 MiB</strong>；格式或大小不合格会被直接拒绝，不会留下文件。上传需填写说明，
+      上传/移除都会基于当前版本<strong>原子另存新版本</strong>（过期返回 409）。附件跟随事件的持续身份：
+      改名、普通保存继续保留；移除只影响新版本，<strong>旧版本仍可在「历史版本」回看时下载当时的原件</strong>。
+      新建事件请先保存，再上传附件。</p>
+    <div id="attachments-panel"></div>
+
     <h2>“先于”关系</h2>
     <p class="hint">A 先于 B：A 结束到 B 开始的间隔可设最短/最长等待（非负整数分钟，最长可空 = 不限）。
       即 A 结束 + 最短等待 ≤ B 开始 ≤ A 结束 + 最长等待；不设置时按旧语义 A 开始 + A 持续 ≤ B 开始 推算。</p>

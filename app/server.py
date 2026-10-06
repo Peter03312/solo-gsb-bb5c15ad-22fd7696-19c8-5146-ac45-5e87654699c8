@@ -16,6 +16,10 @@
   GET    /api/reviews/{id}/compare?from={v1}&to={v2}  两版本对照（只读，按事件持续身份配对）
   POST   /api/reviews/{id}/merge/preview              并入预览（只读）：{source_review_id, source_version, event_uids}
   POST   /api/reviews/{id}/merge/confirm              确认并入，另存为新草稿版本：{source_review_id, source_version, event_uids, base_version, digest}
+  POST   /api/reviews/{id}/events/{uid}/attachments   上传证据附件（multipart：file + description + base_version），原子另存新版本
+  DELETE /api/reviews/{id}/attachments/{aid}          移除当前附件关联 {base_version}：只影响新版本，旧版本仍可下载
+  GET    /api/reviews/{id}/attachments/{sha}          下载当前附件（?filename= 同名内容消歧）
+  GET    /api/reviews/{id}/versions/{v}/attachments/{sha}  下载某历史版本当时的附件原件（只读快照）
   DELETE /api/reviews/{id}        删除复盘
 
 并发控制：所有修改请求必须携带 base_version，与服务器当前版本一致才接受，
@@ -25,11 +29,13 @@
 import json
 import os
 import re
+import urllib.parse
 from datetime import datetime
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from urllib.parse import parse_qs, urlparse
 
+import attachments as att
 import db
 import tzutil
 
@@ -267,6 +273,63 @@ class Handler(BaseHTTPRequestHandler):
         except (ValueError, UnicodeDecodeError):
             raise ApiError(400, "请求体不是合法的 JSON")
 
+    def _read_upload(self):
+        """读取并解析 multipart/form-data 上传（file + base_version/description）。
+
+        请求体超过 20 MiB + 信封开销直接 413；结构错误、缺文件、文件类型或
+        大小不合格抛 ApiError——所有拒绝都发生在写库/落盘之前，不留文件。
+        """
+        length = int(self.headers.get("Content-Length") or 0)
+        limit = att.MAX_SIZE + att.MAX_ENVELOPE
+        if length <= 0:
+            raise ApiError(400, "请求体为空")
+        if length > limit:
+            raise ApiError(413, "上传内容过大：单文件不得超过 {} MiB".format(
+                att.MAX_SIZE // (1024 * 1024)))
+        ctype = self.headers.get("Content-Type", "")
+        m = re.fullmatch(r"multipart/form-data;\s*boundary=([!-~]+)", ctype)
+        if not m:
+            raise ApiError(400, "上传必须使用 multipart/form-data（含 boundary）")
+        body = self.rfile.read(length)
+        if len(body) < length:
+            raise ApiError(400, "请求体读取不完整")
+        try:
+            fields, files = att.parse_multipart(body, m.group(1))
+        except att.AttachmentError as e:
+            raise ApiError(e.status, e.message)
+        if not files:
+            raise ApiError(400, "缺少上传文件字段（字段名须为 file）")
+        if len(files) > 1:
+            raise ApiError(400, "一次只能上传一个附件")
+        uploaded = files[0]
+        if uploaded["name"] != "file":
+            raise ApiError(400, "上传文件字段名必须为 file")
+        raw_name = uploaded["filename"]
+        try:
+            filename = att.normalize_filename(raw_name)
+            content_type = att.sniff(filename, uploaded["content"])
+        except att.AttachmentError as e:
+            raise ApiError(e.status, e.message)
+        return filename, content_type, fields, uploaded["content"]
+
+    def _send_download(self, info):
+        """以原始字节流式返回附件，带 Content-Disposition 与校验元信息头。"""
+        data = Path(info["path"]).read_bytes()
+        fname = info["filename"]
+        self.send_response(200)
+        self.send_header("Content-Type", info["content_type"])
+        self.send_header("Content-Length", str(len(data)))
+        # RFC 5987：filename* 承载 UTF-8 文件名，filename 给 ASCII 回退
+        ascii_fallback = fname.encode("ascii", "ignore").decode("ascii") or "attachment"
+        self.send_header(
+            "Content-Disposition",
+            "attachment; filename=\"{}\"; filename*=UTF-8''{}".format(
+                ascii_fallback.replace('"', ""),
+                urllib.parse.quote(fname, safe="")))
+        self.send_header("X-SHA-256", info["sha256"])
+        self.end_headers()
+        self.wfile.write(data)
+
     def _dispatch(self, method):
         path = self.path.split("?", 1)[0].rstrip("/") or "/"
         try:
@@ -397,6 +460,48 @@ class Handler(BaseHTTPRequestHandler):
                     })
                 return self._send_json(200, db.get_bundle(DB_PATH, rid))
 
+            # ---- 证据附件：上传（multipart）/ 移除 / 当前与历史下载 ----
+            m = re.fullmatch(
+                r"/api/reviews/(\d+)/events/([0-9a-fA-F]{1,64})/attachments", path)
+            if m and method == "POST":
+                rid = int(m.group(1))
+                uid = m.group(2).lower()
+                filename, _ctype, fields, data = self._read_upload()
+                try:
+                    base_version = int(fields.get("base_version"))
+                except (TypeError, ValueError):
+                    raise ApiError(400, "缺少 base_version（用于并发版本校验）")
+                description = att.normalize_description(fields.get("description"))
+                db.add_attachment(DB_PATH, rid, base_version, uid, filename,
+                                  description, data)
+                return self._send_json(200, db.get_bundle(DB_PATH, rid))
+
+            m = re.fullmatch(r"/api/reviews/(\d+)/attachments/(\d+)", path)
+            if m and method == "DELETE":
+                rid, aid = int(m.group(1)), int(m.group(2))
+                body = self._read_json()
+                if not isinstance(body.get("base_version"), int):
+                    raise ApiError(400, "缺少 base_version（用于并发版本校验）")
+                db.remove_attachment(DB_PATH, rid, body["base_version"], aid)
+                return self._send_json(200, db.get_bundle(DB_PATH, rid))
+
+            m = re.fullmatch(r"/api/reviews/(\d+)/attachments/([0-9a-fA-F]{64})", path)
+            if m and method == "GET":
+                rid, sha = int(m.group(1)), m.group(2).lower()
+                qs = parse_qs(urlparse(self.path).query)
+                filename = qs.get("filename", [None])[0]
+                info = db.get_current_attachment(DB_PATH, rid, sha, filename)
+                return self._send_download(info)
+
+            m = re.fullmatch(
+                r"/api/reviews/(\d+)/versions/(\d+)/attachments/([0-9a-fA-F]{64})", path)
+            if m and method == "GET":
+                rid, ver, sha = int(m.group(1)), int(m.group(2)), m.group(3).lower()
+                qs = parse_qs(urlparse(self.path).query)
+                filename = qs.get("filename", [None])[0]
+                info = db.get_version_attachment(DB_PATH, rid, ver, sha, filename)
+                return self._send_download(info)
+
             raise ApiError(404, "not found")
         except ApiError as e:
             self._send_json(e.status, e.payload)
@@ -418,6 +523,10 @@ class Handler(BaseHTTPRequestHandler):
             self._send_json(400, {"error": str(e)})
         except db.FinalizeRejected as e:
             self._send_json(400, {"error": str(e)})
+        except db.AttachmentRejected as e:
+            self._send_json(e.status, {"error": str(e)})
+        except att.AttachmentError as e:
+            self._send_json(e.status, {"error": e.message})
 
     def do_GET(self):
         self._dispatch("GET")

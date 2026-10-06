@@ -101,6 +101,31 @@
   - 旧库**缺快照的历史版本明确拒绝（HTTP 422）**，复盘或版本不存在报
     **404**；网页在当前结果区与版本回看弹窗的冲突卡片上提供入口。
   对应接口：`GET /api/reviews/{id}/versions/{v}/diagnosis`。
+- **事故证据附件（本轮新增）**：为已保存的事件留存现场证据（日志、截图、
+  PDF），附件跟随事件的**持续身份**进入每次保存的**不可变快照**，审阅者
+  在任意历史版本中都能看到并下载当时的原件。
+  - 支持**文本**（.txt/.text/.log/.md/.csv/.json/.xml，须为合法 UTF-8 且
+    不含 NUL）、**PNG**、**JPEG（.jpg/.jpeg）**、**PDF**；按扩展名 + 文件
+    内容魔数双重判定（把可执行文件改名为 .png 会被拒），单文件不超过
+    **20 MiB**；格式或大小不合格一律拒绝（400/413），**不产生新版本、不留
+    文件**。上传须填写说明，可查看文件名、大小、**SHA-256** 并下载。
+  - 上传、移除都是基于当前 `base_version` 的**原子另存新版本**（版本类型
+    `attachment`）：并发过期返回 **409**；事务失败回滚，物理文件采用
+    “先写临时文件、提交后原子改名”，**不产生部分版本或孤儿文件**。
+  - 附件**关联事件持续身份（uid）**：改名、普通保存继续保留；**移除当前
+    附件只影响新版本**——旧版本不可变快照中的附件描述符仍在，历史版本
+    始终可下载原件。**恢复历史版本**时以该版的附件集合生成新草稿。
+  - **跨复盘并入**时仅复制入选事件的**附件关联**（内容按 SHA-256 全局
+    内容寻址、物理文件只存一份，不复制字节）；来源复盘/来源事件删除后，
+    目标的当前关联与历史快照仍可下载原件。
+  - **旧快照无附件字段视为空集合**（旧库历史版本没有附件，不回填、不
+    虚构）。物理文件采用引用计数式清理：**仅当没有任何当前关联或历史
+    快照引用时才删除**；并入跨复盘共享的 blob 在来源删除后由目标引用
+    保留。
+  - 网页在「事件」表下方提供每个已保存事件的上传（文件选择 + 说明）、
+    附件清单（文件名/大小/SHA-256/说明/下载/移除）；版本回看弹窗与版本
+    列表展示该版附件数量并可直接下载当时原件。HTTP API 支持完整操作
+    （见下方“事故证据附件”一节的 curl 示例）。
 
 ## 容器启动
 
@@ -127,6 +152,7 @@ docker run -d -p 8000:8000 -v retro-timeline-data:/data --name retro-timeline re
 | `PORT` | `8000` | 服务监听端口。Compose 中同时用于宿主机映射：`PORT=9000 docker compose up` 后访问 `http://localhost:9000` |
 | `HOST` | `0.0.0.0` | 监听地址 |
 | `DB_PATH` | `/data/timeline.db` | SQLite 数据库文件路径。容器内 `/data` 为挂载卷，删除容器数据不丢失 |
+| `ATTACHMENT_DIR` | `<DB 所在目录>/attachments`（容器内即 `/data/attachments`） | 证据附件物理文件目录（内容寻址：`<dir>/<sha前2位>/<sha>`），与数据库同在 `/data` 卷；删除容器附件不丢失 |
 
 Compose 示例（`docker-compose.yml`）中已包含命名卷 `timeline-data` 用于持久化；
 如改用宿主机目录，可将卷替换为 `./data:/data`。
@@ -148,6 +174,9 @@ python3 tests/test_merge_api.py # 并入 HTTP API 端到端测试（预览/确�
 python3 tests/test_merge_origin.py # 并入事件来源摘要测试（来源与新身份绑定、再保存/恢复/对照保留、来源删除后仍显示、非并入事件无来源）
 python3 tests/test_diagnose.py  # 冲突最小约束组分析单元测试（差分约束负环、极小性、时区绝对分钟、排除项、稳定性）
 python3 tests/test_api_diagnose.py # 冲突分析 HTTP API 端到端测试（极小组、空组、404/422、只读、暂存排除）
+python3 tests/test_attachments.py   # 附件类型/大小校验与 multipart 解析单元测试（扩展名+魔数、UTF-8/RFC5987 文件名）
+python3 tests/test_attachments_db.py # 附件持久化测试（身份关联、旧版本留存、恢复/并入复制、GC、原子性、迁移）
+python3 tests/test_attachments_api.py # 附件 HTTP API 端到端测试（上传/下载/移除/409/400/413、历史下载、并入后来源删除）
 ```
 
 > 跨地区时区依赖系统 IANA 时区库（Python 标准库 `zoneinfo` 读取
@@ -171,6 +200,10 @@ python3 tests/test_api_diagnose.py # 冲突分析 HTTP API 端到端测试（极
 | GET | `/api/reviews/{id}/compare?from={v1}&to={v2}` | 两版本对照（只读）：须 `v1 < v2`；顺序无效 400、版本不存在 404、旧库无快照 422 |
 | POST | `/api/reviews/{id}/merge/preview` | 并入预览（只读）：`{source_review_id, source_version, event_uids}`；返回复制事件（每个带 `origin` 来源摘要）、两端均入选的关系、合并后推算结论与 `digest`；来源/目标相同 400、事件不存在 400、来源缺快照 422、复盘或版本不存在 404 |
 | POST | `/api/reviews/{id}/merge/confirm` | 确认并入，一次性另存为目标新草稿版本：`{source_review_id, source_version, event_uids, base_version, digest}`；复制事件取得全新 uid 且其 `origin` 保存来源复盘/版本/来源事件身份与名称（之后保存、恢复不丢失；来源被删后仍显示保存摘要）；目标过期 409、digest 与预览不符 400 |
+| POST | `/api/reviews/{id}/events/{uid}/attachments` | 上传证据附件（`multipart/form-data`：文件字段 `file` + `base_version` + `description`），原子另存 `attachment` 新版本；返回最新复盘 bundle，事件带 `attachments[]`（文件名/大小/SHA-256/说明/上传时间）；类型不符 400、超过 20MiB 413、事件不存在 400、版本过期 409 |
+| DELETE | `/api/reviews/{id}/attachments/{aid}` | 移除当前附件关联（JSON `{base_version}`）并另存新版本；只影响新版本，旧版本快照仍可下载；附件不存在 404、版本过期 409 |
+| GET | `/api/reviews/{id}/attachments/{sha256}?filename=` | 下载当前附件原件（同名内容多关联时用 `filename` 消歧）；响应头含 `X-SHA-256` 与 RFC 5987 `Content-Disposition`；不存在 404 |
+| GET | `/api/reviews/{id}/versions/{v}/attachments/{sha256}?filename=` | 下载某历史版本当时留存的附件原件（读不可变快照 + 内容库；移除当前附件不影响此接口）；旧库无快照 422、版本/附件不存在 404 |
 | DELETE | `/api/reviews/{id}` | 删除复盘 |
 
 ### 版本回看与恢复（HTTP 示例）
@@ -423,6 +456,78 @@ curl -s -X POST http://localhost:8000/api/reviews/2/merge/confirm \
 - `origin` 纯展示：不参与 digest，不进入推算，目标事件输入与推算窗口、冲突/
   暂存结论均不因来源展示而改变。
 
+### 事故证据附件（本轮新增，HTTP 示例）
+
+附件跟随事件持续身份 `uid`（`GET /api/reviews/{id}` 中每个事件的 `uid`）。
+上传使用 `multipart/form-data`（文件字段名固定为 `file`），上传/移除都会
+基于当前 `base_version` **原子另存一个 `kind=attachment` 的新版本**。
+
+```bash
+# 0) 准备：先有一个已保存事件，拿到它的 uid
+RID=1
+UID=$(curl -s http://localhost:8000/api/reviews/$RID \
+  | python3 -c 'import sys,json;print(json.load(sys.stdin)["events"][0]["uid"])')
+
+# 1) 上传文本证据（也可传 .png/.jpg/.jpeg/.pdf 与 .log/.md/.csv/.json/.xml 文本）
+curl -s -X POST http://localhost:8000/api/reviews/$RID/events/$UID/attachments \
+  -F "file=@./值班记录.txt" \
+  -F "base_version=2" \
+  -F "description=03:10 值班群导出的现场日志"
+# 返回最新复盘 bundle（version=3）；事件对象带 attachments：
+# {"review": {"id":1,"version":3,...},
+#  "events":[{"uid":"...","name":"告警",
+#    "attachments":[{"id":1,"filename":"值班记录.txt",
+#      "size_bytes":128,"sha256":"ae9416be…","content_type":"text/plain; charset=utf-8",
+#      "description":"03:10 值班群导出的现场日志","uploaded_at":"2026-10-06T11:20:03"}]}],
+#  ...}
+
+# 2) 下载当前附件（响应头 X-SHA-256 可与本地核对；中文文件名走 RFC5987）
+SHA=ae9416be5d01b5b90c664055aaafcef4b938df2c758b3e236e4c49c753655b0e
+curl -s -D - http://localhost:8000/api/reviews/$RID/attachments/$SHA -o 值班记录.txt
+# Content-Type: text/plain; charset=utf-8
+# Content-Disposition: attachment; filename="....txt"; filename*=UTF-8''%E5%80%BC...
+# X-SHA-256: ae9416be…
+
+# 3) 移除当前附件（只影响新版本；历史版本仍可下载）
+curl -s -X DELETE http://localhost:8000/api/reviews/$RID/attachments/1 \
+  -H 'Content-Type: application/json' -d '{"base_version": 3}'   # -> version=4
+
+# 4) 下载历史版本（v3）当时的原件：移除当前附件后仍然 200
+curl -s -OJ http://localhost:8000/api/reviews/$RID/versions/3/attachments/$SHA
+
+# 5) 版本回看/列表中的附件信息
+curl -s http://localhost:8000/api/reviews/$RID/versions
+# v3 条目：{"version":3,"kind":"attachment","attachment_count":1,...}
+curl -s http://localhost:8000/api/reviews/$RID/versions/3
+# input.events[].attachments[] 即该版不可变附件描述符（无 live 行 id）
+```
+
+错误与并发：
+
+```bash
+# 类型/扩展名不符（含改名伪装）→ 400；超过 20 MiB → 413；不留文件、不产生版本
+curl -s -F "file=@./evil.png" -F "base_version=2" .../events/$UID/attachments
+# 400 {"error": "文件「evil.png」扩展名为 .png，但内容不是 PNG 图片"}
+
+# base_version 过期（他人已保存/上传/移除）→ 409
+# 409 {"error": "该复盘已被其他成员保存了更新的版本…", "current_version": 4}
+
+# 事件不存在或不属于该复盘 → 400；附件/复盘不存在 → 404；
+# 旧库无快照版本下载历史附件 → 422
+```
+
+要点：
+
+- **改名、普通保存**附件不丢（按 uid 重新关联）；事件被删除则其当前关联
+  移除，但引用过它的旧版本快照仍保留原件。
+- **恢复历史版本**（`POST .../versions/{v}/restore`）以该版附件集合生成
+  新草稿；**跨复盘并入**只复制入选事件的附件关联（物理 blob 按 SHA-256
+  共享一份），来源复盘删除后目标当前与历史都仍可下载。
+- 相同内容（同复盘/跨复盘）只占一份物理存储；重复上传同一文件幂等，
+  不产生新版本。物理文件**仅在没有任何当前关联或历史快照引用时**才清理。
+- 附件物理目录默认是数据库旁的 `attachments/`（容器内 `/data/attachments`，
+  随卷持久化），可用 `ATTACHMENT_DIR` 覆盖。
+
 ### “先于”关系的间隔设置（HTTP 示例）
 
 每条关系可携带 `min_gap_minutes`（最短等待，非负整数分钟，缺省 0）与
@@ -583,9 +688,10 @@ curl -s -X PUT http://localhost:8000/api/reviews/1 \
 
 ```
 app/
-  server.py          HTTP 服务（标准库 http.server）、间隔设置校验、时区/偏移校验、对照与并入路由
-  db.py              SQLite 持久化、乐观锁、事件持续身份（uid）、启动时建表与老库迁移、并入事务
-  merge.py           跨复盘并入的纯规划逻辑（复制选择、两端入选关系、合并推算与 digest；预览/确认共用）
+  server.py          HTTP 服务（标准库 http.server）、间隔设置校验、时区/偏移校验、对照与并入路由、附件 multipart 上传/下载
+  db.py              SQLite 持久化、乐观锁、事件持续身份（uid）、启动时建表与老库迁移、并入事务、证据附件 blob 内容库与 GC
+  attachments.py     附件类型/大小校验（扩展名+魔数、UTF-8/RFC5987 文件名）与 multipart/form-data 解析（仅标准库）
+  merge.py           跨复盘并入的纯规划逻辑（复制选择、两端入选关系、合并推算与 digest；入选事件附件关联一并复制；预览/确认共用）
   compute.py         时间窗推算与依据链生成（含间隔上下界传播、跨时区绝对分钟推算）
   diagnose.py        版本冲突最小不可满足约束组分析（差分约束图负环、删除式收缩保证极小性，只读）
   tzutil.py          IANA 时区与带偏移当地时间校验（夏令时 gap/重复时刻）、按时区展示
@@ -603,5 +709,8 @@ tests/test_merge_api.py 并入 HTTP API 端到端测试（预览/确认、错误
 tests/test_merge_origin.py 并入事件来源摘要测试（来源与新身份绑定、再保存/恢复/对照保留、来源删除后仍显示）
 tests/test_diagnose.py 冲突最小约束组分析单元测试（负环、极小性、时区绝对分钟、排除项、稳定性）
 tests/test_api_diagnose.py 冲突分析 HTTP API 端到端测试（极小组、空组、404/422、只读、暂存排除）
+tests/test_attachments.py    附件类型/大小校验与 multipart 解析单元测试（扩展名+魔数、UTF-8/RFC5987 文件名）
+tests/test_attachments_db.py 附件持久化测试（身份关联、历史留存、恢复/并入复制、GC、原子、迁移）
+tests/test_attachments_api.py 附件 HTTP API 端到端测试（上传/下载/移除、400/409/413、历史下载、来源删除）
 Dockerfile / docker-compose.yml / .dockerignore
 ```

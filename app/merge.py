@@ -47,6 +47,12 @@ def _canon_event(token, e):
     }
 
 
+def _attachments_of(e):
+    """来源快照事件上的附件描述符（只读复制；无附件的旧快照为空列表）。"""
+    items = e.get("attachments")
+    return [dict(a) for a in items if isinstance(a, dict) and a.get("sha256")]
+
+
 def _gap_min(r):
     g = r.get("min_gap_minutes")
     return 0 if g is None else int(g)
@@ -237,6 +243,11 @@ def save_payload(plan, source_meta=None):
         if origin is not None:
             # 来源摘要随复制事件固化；与新 uid 绑定，来源被删/改名后仍可读
             item["origin"] = origin
+        if e.get("attachments"):
+            # 入选事件的**附件关联**一并复制：只复制关联（指向同一 blob
+            # 内容库行，不复制物理文件），稍后由 db 层挂到目标新 uid 上；
+            # 来源复盘/来源事件删除后，目标仍能凭 blob 下载原件。
+            item["attachments"] = [dict(a) for a in e["attachments"]]
         events.append(item)
 
     relations = []

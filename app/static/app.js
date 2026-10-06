@@ -125,6 +125,7 @@ function render() {
   $("#btn-finalize").disabled = b.review.status === "finalized";
 
   renderEventsTable();
+  renderAttachmentsPanel();
   renderRelations();
   renderResults();
 }
@@ -190,9 +191,147 @@ function renderEventsTable() {
   }
 }
 
+/* -------------------------------------------------------------- 证据附件 */
+
+const ATT_MAX_BYTES = 20 * 1024 * 1024;
+const ATT_EXT_OK = /\.(txt|text|log|md|csv|json|xml|png|jpe?g|pdf)$/i;
+
+function fmtSize(n) {
+  if (n < 1024) return n + " B";
+  if (n < 1024 * 1024) return (n / 1024).toFixed(1) + " KiB";
+  return (n / (1024 * 1024)).toFixed(2) + " MiB";
+}
+
+function shortSha(sha) { return sha ? String(sha).slice(0, 12) + "…" : ""; }
+
+function currentAttachmentUrl(sha, filename) {
+  return `/api/reviews/${state.current.review.id}/attachments/${sha}` +
+    (filename ? `?filename=${encodeURIComponent(filename)}` : "");
+}
+
+function versionAttachmentUrl(version, sha, filename) {
+  return `/api/reviews/${state.current.review.id}/versions/${version}/attachments/${sha}` +
+    (filename ? `?filename=${encodeURIComponent(filename)}` : "");
+}
+
+/* 当前 live 附件的展示卡片（网页 GET 链接；API 调用见 README）。 */
+function attachmentItemHtml(a, version) {
+  const url = version
+    ? versionAttachmentUrl(version, a.sha256, a.filename)
+    : currentAttachmentUrl(a.sha256, a.filename);
+  const dl = `<a class="att-dl" href="${url}" title="下载原件">下载</a>`;
+  const rm = version ? "" :
+    `<button class="att-rm" data-aid="${a.id}" title="移除当前附件（旧版本仍保留原件）">移除</button>`;
+  return `<li class="att-item" data-sha="${escapeHtml(a.sha256)}">` +
+    `<span class="att-icon">${attIcon(a.filename)}</span>` +
+    `<span class="att-meta"><span class="att-name">${escapeHtml(a.filename)}</span>` +
+    `<span class="hint">${fmtSize(a.size_bytes)} · <code title="${escapeHtml(a.sha256)}">${shortSha(a.sha256)}</code>` +
+    (a.description ? ` · ${escapeHtml(a.description)}` : "") +
+    (a.uploaded_at ? ` · 上传于 ${escapeHtml(String(a.uploaded_at).replace("T", " "))}` : "") +
+    `</span></span><span class="att-ops">${dl}${rm}</span></li>`;
+}
+
+function attIcon(filename) {
+  const ext = (filename.split(".").pop() || "").toLowerCase();
+  if (ext === "png" || ext === "jpg" || ext === "jpeg") return "🖼";
+  if (ext === "pdf") return "📄";
+  return "📝";
+}
+
+function renderAttachmentsPanel() {
+  const box = $("#attachments-panel");
+  if (!box) return;
+  const saved = state.current.events.filter((e) => e.uid);
+  if (!saved.length) {
+    box.innerHTML = `<div class="hint">没有已保存的事件。请先在上方添加事件并保存，再为其上传证据附件。</div>`;
+    return;
+  }
+  box.innerHTML = saved.map((e) => {
+    const list = (e.attachments || []);
+    const items = list.length
+      ? `<ul class="att-list">${list.map((a) => attachmentItemHtml(a, null)).join("")}</ul>`
+      : `<div class="hint">暂无附件</div>`;
+    return `<div class="att-card" data-uid="${escapeHtml(e.uid)}">` +
+      `<div class="att-head"><strong>「${escapeHtml(e.name)}」</strong>` +
+      `<label class="att-upload">选择文件（文本/PNG/JPEG/PDF，≤20MiB）` +
+      `<input type="file" class="att-file" accept=".txt,.text,.log,.md,.csv,.json,.xml,.png,.jpg,.jpeg,.pdf">` +
+      `</label>` +
+      `<input type="text" class="att-desc" maxlength="2000" placeholder="附件说明（必填，例如：03:10 值班群截图）">` +
+      `<button class="att-submit">上传</button></div>${items}</div>`;
+  }).join("");
+
+  box.querySelectorAll(".att-card").forEach((card) => {
+    const uid = card.dataset.uid;
+    card.querySelector(".att-submit").addEventListener("click", () => uploadAttachment(uid, card));
+    card.querySelectorAll(".att-rm").forEach((btn) => {
+      btn.addEventListener("click", () => removeAttachment(parseInt(btn.dataset.aid, 10)));
+    });
+  });
+}
+
+/* 上传前的网页端预检（减轻无效请求）；服务端仍做权威的扩展名 + 魔数 + 大小校验。 */
+function preflightUpload(file) {
+  if (!file) return "请先选择要上传的文件";
+  if (!ATT_EXT_OK.test(file.name)) return "不支持的文件类型：仅支持文本、PNG、JPEG 或 PDF";
+  if (file.size <= 0) return "文件内容为空";
+  if (file.size > ATT_MAX_BYTES) {
+    return `文件过大：${fmtSize(file.size)}，单个附件不得超过 20 MiB`;
+  }
+  return null;
+}
+
+async function uploadAttachment(uid, card) {
+  if (!state.current) return;
+  const file = card.querySelector(".att-file").files[0];
+  const desc = card.querySelector(".att-desc").value.trim();
+  const problem = preflightUpload(file);
+  if (problem) { showBanner("⚠ " + escapeHtml(problem)); return; }
+  if (!desc) { showBanner("⚠ 请填写附件说明"); return; }
+  const fd = new FormData();
+  fd.append("file", file);
+  fd.append("base_version", String(state.current.review.version));
+  fd.append("description", desc);
+  try {
+    const resp = await fetch(
+      `/api/reviews/${state.current.review.id}/events/${uid}/attachments`,
+      { method: "POST", body: fd });
+    const data = await resp.json().catch(() => ({}));
+    if (!resp.ok) {
+      const err = new Error(data.error || ("HTTP " + resp.status));
+      err.status = resp.status; err.data = data;
+      throw err;
+    }
+    state.current = data;
+    resetEdits();
+    hideBanner();
+    render();
+    loadVersions();
+    loadReviews(data.review.id).then(() => loadMergeReviews());
+  } catch (err) {
+    handleSaveError(err);
+  }
+}
+
+async function removeAttachment(aid) {
+  if (!state.current) return;
+  if (!confirm("确定移除该附件的当前关联吗？\n将另存新版本；历史版本中仍保留并可下载原件。")) return;
+  try {
+    const data = await api(
+      "DELETE", `/api/reviews/${state.current.review.id}/attachments/${aid}`,
+      { base_version: state.current.review.version });
+    state.current = data;
+    resetEdits();
+    hideBanner();
+    render();
+    loadVersions();
+    loadReviews(data.review.id).then(() => loadMergeReviews());
+  } catch (err) {
+    handleSaveError(err);
+  }
+}
+
 /* 间隔展示文案：未设置（最短 0 / 最长不限）时不附加说明，与旧语义一致 */
-function gapText(r) {
-  const min = r.min_gap_minutes === null || r.min_gap_minutes === undefined ? 0 : Number(r.min_gap_minutes);
+function gapText(r) {  const min = r.min_gap_minutes === null || r.min_gap_minutes === undefined ? 0 : Number(r.min_gap_minutes);
   const max = r.max_gap_minutes === null || r.max_gap_minutes === undefined || r.max_gap_minutes === ""
     ? null : Number(r.max_gap_minutes);
   const parts = [];
@@ -495,7 +634,7 @@ async function loadVersions() {
     const cur = v.version === data.current_version;
     let html = `<td>v${v.version}${cur ? ' <span class="kind-tag">当前</span>' : ""}</td>`;
     html += `<td>${kindTag(v)}</td>`;
-    html += `<td>${statusText(v)}</td>`;
+    html += `<td>${statusText(v)}${v.attachment_count ? ` <span class="kind-tag att">附件 ${v.attachment_count}</span>` : ""}</td>`;
     html += `<td class="hint">${(v.computed_at || "").replace("T", " ")}</td>`;
     html += `<td class="version-actions"></td>`;
     tr.innerHTML = html;
@@ -539,6 +678,7 @@ function kindTag(v) {
   if (v.kind === "finalize") return `<span class="kind-tag finalize">已定稿</span>`;
   if (v.kind === "merge") return `<span class="kind-tag restore">并入产生</span>`;
   if (v.kind === "restore") return `<span class="kind-tag restore">恢复产生</span>`;
+  if (v.kind === "attachment") return `<span class="kind-tag att">附件变更</span>`;
   if (v.kind === "save") return `<span class="kind-tag">保存</span>`;
   return `<span class="kind-tag">历史记录</span>`;
 }
@@ -592,7 +732,8 @@ function renderVersionDetail(detail) {
     `<td>${fmtTime(e.earliest_start)}</td>` +
     `<td>${fmtTime(e.latest_start)}</td>` +
     `<td>${e.duration_minutes === null || e.duration_minutes === undefined ? "—" : e.duration_minutes}</td>` +
-    `<td>${escapeHtml(e.note || "")}</td></tr>`).join("");
+    `<td>${escapeHtml(e.note || "")}</td>` +
+    `<td>${(e.attachments || []).length}</td></tr>`).join("");
 
   const rels = (detail.input.relations || []).map((r) => {
     const a = byKey[r.predecessor_key], b = byKey[r.successor_key];
@@ -601,13 +742,28 @@ function renderVersionDetail(detail) {
     return `<div>「${escapeHtml(an)}」先于「${escapeHtml(bn)}」${escapeHtml(gapText(r))}</div>`;
   }).join("") || `<div class="hint">无</div>`;
 
+  // 该历史版本的证据附件（不可变快照中的描述符；移除当前附件不影响此处下载）
+  const attGroups = events
+    .map((e) => ({ e, items: e.attachments || [] }))
+    .filter((g) => g.items.length);
+  let attachmentsHtml = "";
+  if (attGroups.length) {
+    attachmentsHtml = `<div class="section-title">该版本留存的证据附件（${attGroups.reduce(
+      (n, g) => n + g.items.length, 0)} 个，可下载当时原件）</div>` +
+      attGroups.map((g) =>
+        `<div class="card"><h3>「${escapeHtml(g.e.name)}」</h3>` +
+        `<ul class="att-list">${g.items.map((a) => attachmentItemHtml(a, detail.version)).join("")}</ul></div>`
+      ).join("");
+  }
+
   // 快照事件以 id_<旧行id> 为 key，推算结果窗口仍以旧行 id 为键
   const winIndex = {};
   for (const e of events) winIndex[String(e.key).replace(/^id_/, "")] = e;
   const parts = buildResultHtml(detail.result, winIndex, detail.version);
   return `<div class="section-title">当时输入（不可变快照）</div>` +
     `<table><thead><tr><th>事件名称</th><th>时区</th><th>最早开始</th><th>最晚开始</th>` +
-    `<th>持续(分钟)</th><th>备注</th></tr></thead><tbody>${rows}</tbody></table>` +
+    `<th>持续(分钟)</th><th>备注</th><th>附件</th></tr></thead><tbody>${rows}</tbody></table>` +
+    attachmentsHtml +
     `<div class="section-title">“先于”关系</div><div class="vm-relations">${rels}</div>` +
     `<div class="section-title">当时推算依据与结果</div>` +
     parts.summary + parts.conflicts + parts.drafts + parts.skipped + parts.windows;
@@ -925,6 +1081,7 @@ function renderMergePicker() {
       `<td>${fmtTime(e.earliest_start)}</td>` +
       `<td>${fmtTime(e.latest_start)}</td>` +
       `<td>${e.duration_minutes === null || e.duration_minutes === undefined ? "—" : e.duration_minutes}</td>` +
+      `<td>${(e.attachments || []).length ? `📎 ${(e.attachments || []).length}` : ""}</td>` +
       `<td>${draft ? '<span class="badge warn">暂存</span>' : ""}</td>` +
       `</tr>`;
   }).join("");
@@ -945,7 +1102,7 @@ function renderMergePicker() {
       `<button id="btn-merge-preview" class="primary">预览并入</button>` +
     `</div>` +
     `<table class="merge-events"><thead><tr><th></th><th>事件名称</th><th>时区</th>` +
-      `<th>最早开始</th><th>最晚开始</th><th>持续(分钟)</th><th></th></tr></thead>` +
+      `<th>最早开始</th><th>最晚开始</th><th>持续(分钟)</th><th>附件</th><th></th></tr></thead>` +
       `<tbody>${rows}</tbody></table>` +
     `<div class="section-title">来源中的“先于”关系（仅两端均入选才复制，保留最短/最长等待）</div>` +
     `<div class="mp-rel">${relLines || '<span class="hint">无</span>'}</div>`;
@@ -1020,7 +1177,8 @@ function renderMergeModal(data) {
     `<tr><td>${escapeHtml(e.name)}</td><td>${escapeHtml(e.timezone || "")}</td>` +
     `<td>${fmtTime(e.earliest_start)}</td><td>${fmtTime(e.latest_start)}</td>` +
     `<td>${e.duration_minutes === null || e.duration_minutes === undefined ? "—" : e.duration_minutes}</td>` +
-    `<td>${escapeHtml(e.note || "")}</td></tr>`).join("");
+    `<td>${escapeHtml(e.note || "")}</td>` +
+    `<td>${(e.attachments || []).length ? `📎 ${(e.attachments || []).length}（关联一并复制）` : ""}</td></tr>`).join("");
   const rels = data.copied_relations.map((r) =>
     `<div>「${escapeHtml(r.predecessor.name || "?")}」先于「${escapeHtml(r.successor.name || "?")}」` +
     `${escapeHtml(gapText(r))}</div>`).join("") || `<div class="hint">无（没有两端均入选的关系）</div>`;

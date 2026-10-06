@@ -198,3 +198,29 @@ table.cmp th, table.cmp td { padding: 4px 6px; }
 .dg-constraints li { margin-bottom: 6px; }
 .dg-type { display: inline-block; font-size: 11px; color: var(--accent); margin-bottom: 2px; }
 .dg-time { font-family: ui-monospace, monospace; font-size: 12px; color: var(--accent); white-space: nowrap; }
+
+/* ------------------------------------------------------------ 证据附件 */
+#attachments-panel { display: flex; flex-direction: column; gap: 10px; margin: 8px 0; }
+.att-card {
+  background: var(--panel2); border: 1px solid var(--border);
+  border-radius: 8px; padding: 10px 12px;
+}
+.att-head { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; }
+.att-head strong { margin-right: 4px; }
+.att-upload { display: flex; align-items: center; gap: 6px; color: var(--muted); font-size: 12px; }
+.att-desc { flex: 1 1 220px; min-width: 180px; }
+.att-list { list-style: none; margin: 8px 0 0; padding: 0; display: flex; flex-direction: column; gap: 6px; }
+.att-item {
+  display: flex; align-items: center; gap: 10px;
+  background: var(--bg); border: 1px solid var(--border);
+  border-radius: 6px; padding: 6px 10px;
+}
+.att-icon { font-size: 16px; }
+.att-meta { display: flex; flex-direction: column; gap: 2px; flex: 1 1 auto; min-width: 0; }
+.att-name { font-weight: 600; word-break: break-all; }
+.att-meta code { font-size: 11px; color: var(--muted); }
+.att-ops { display: flex; gap: 8px; align-items: center; }
+.att-dl { color: var(--accent); text-decoration: none; }
+.att-dl:hover { text-decoration: underline; }
+.att-rm { color: var(--err); }
+.kind-tag.att { background: rgba(79,140,255,.18); color: #9dbdff; }
