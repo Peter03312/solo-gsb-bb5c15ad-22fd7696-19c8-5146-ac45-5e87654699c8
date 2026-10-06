@@ -34,10 +34,14 @@
       跨地区事故可在「时区」列填写 IANA 时区（如 Asia/Shanghai、America/New_York，留空表示不指定时区）；
       指定时区后，最早/最晚开始须填写<strong>带 UTC 偏移的当地时间</strong>（如 2026-11-01T01:30-05:00），
       偏移须符合该时区当日夏令时规则，否则整次保存会被拒绝。带时区与未带时区的事件之间不能建立“先于”关系。</p>
+    <p class="hint">📎 <strong>事故现场证据</strong>：已保存的事件可上传文本（.txt/.log/.md/.csv/.json）、
+      PNG、JPEG 或 PDF（单文件不超过 20MB，扩展名须与内容一致）并填写说明；可查看文件名、大小、SHA-256 并下载原件。
+      附件跟随事件持续身份，改名和普通保存继续保留；移除附件只影响新版本，历史版本中的附件审阅者随时可回看下载。
+      新添加的事件请先“保存并重新推算”后再上传附件。</p>
     <table id="events-table">
       <thead>
         <tr>
-          <th>事件名称</th><th>时区(IANA)</th><th>最早开始（当地+偏移）</th><th>最晚开始（当地+偏移）</th><th>持续(分钟)</th><th>备注</th><th></th>
+          <th>事件名称</th><th>时区(IANA)</th><th>最早开始（当地+偏移）</th><th>最晚开始（当地+偏移）</th><th>持续(分钟)</th><th>备注</th><th>现场附件</th><th></th>
         </tr>
       </thead>
       <tbody></tbody>
@@ -118,7 +122,7 @@
     <table id="versions-table">
       <thead>
         <tr>
-          <th>版本</th><th>类型</th><th>推算状态</th><th>时间</th><th>操作</th>
+          <th>版本</th><th>类型</th><th>推算状态</th><th>附件</th><th>时间</th><th>操作</th>
         </tr>
       </thead>
       <tbody></tbody>

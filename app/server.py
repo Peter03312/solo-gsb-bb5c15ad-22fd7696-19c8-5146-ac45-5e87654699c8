@@ -16,6 +16,10 @@
   GET    /api/reviews/{id}/compare?from={v1}&to={v2}  两版本对照（只读，按事件持续身份配对）
   POST   /api/reviews/{id}/merge/preview              并入预览（只读）：{source_review_id, source_version, event_uids}
   POST   /api/reviews/{id}/merge/confirm              确认并入，另存为新草稿版本：{source_review_id, source_version, event_uids, base_version, digest}
+  POST   /api/reviews/{id}/events/{uid}/attachments   上传附件（multipart：file + description + base_version），另存新版本
+  DELETE /api/reviews/{id}/attachments/{aid}          移除当前附件关联（只影响新版本，旧版本仍可下载）
+  GET    /api/reviews/{id}/attachments/{aid}/download           下载当前附件原件
+  GET    /api/reviews/{id}/versions/{v}/attachments/{aid}/download  下载某历史版本留存的附件原件
   DELETE /api/reviews/{id}        删除复盘
 
 并发控制：所有修改请求必须携带 base_version，与服务器当前版本一致才接受，
@@ -28,8 +32,9 @@ import re
 from datetime import datetime
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
-from urllib.parse import parse_qs, urlparse
+from urllib.parse import parse_qs, quote, urlparse
 
+import attachments
 import db
 import tzutil
 
@@ -258,6 +263,28 @@ class Handler(BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(data)
 
+    def _send_attachment_download(self, path, row):
+        """以原始字节流式回送附件原件（Content-Disposition 带上传时文件名）。"""
+        size = os.path.getsize(path)
+        filename = row.get("filename") or path.name
+        # RFC 5987：filename* 承载 UTF-8 文件名，ASCII 回退给老式客户端
+        ascii_fallback = filename.encode("ascii", "ignore").decode("ascii") or "attachment"
+        self.send_response(200)
+        self.send_header("Content-Type", row.get("content_type") or "application/octet-stream")
+        self.send_header("Content-Length", str(size))
+        self.send_header(
+            "Content-Disposition",
+            "attachment; filename=\"{}\"; filename*=UTF-8''{}".format(
+                ascii_fallback.replace('"', ""), quote(filename)))
+        self.send_header("X-SHA-256", row.get("blob_sha256", ""))
+        self.end_headers()
+        with open(path, "rb") as f:
+            while True:
+                chunk = f.read(1024 * 1024)
+                if not chunk:
+                    break
+                self.wfile.write(chunk)
+
     def _read_json(self):
         length = int(self.headers.get("Content-Length") or 0)
         if length <= 0 or length > 2 * 1024 * 1024:
@@ -266,6 +293,68 @@ class Handler(BaseHTTPRequestHandler):
             return json.loads(self.rfile.read(length).decode("utf-8"))
         except (ValueError, UnicodeDecodeError):
             raise ApiError(400, "请求体不是合法的 JSON")
+
+    def _handle_attachment_upload(self, rid, event_uid):
+        """multipart/form-data 上传附件：file（必填）+ description + base_version。
+
+        校验（类型/大小/魔数一致性）与数据库事务全部失败时返回 4xx 且**不留下
+        文件**：multipart 阶段产生的临时文件在解析/校验失败时立即删除；事务
+        阶段失败由 db 层回滚并清理，关闭连接避免请求体残余影响复用。
+        """
+        try:
+            length = int(self.headers.get("Content-Length") or 0)
+        except ValueError:
+            raise ApiError(400, "Content-Length 不合法")
+        root = attachments.ensure_storage_dir(DB_PATH)
+        try:
+            fields, parts = attachments.parse_multipart(
+                self.rfile, length, self.headers.get("Content-Type"), root)
+        except attachments.MultipartError as e:
+            self.close_connection = True
+            raise ApiError(400, str(e))
+        except attachments.UploadError as e:
+            self.close_connection = True
+            raise ApiError(400, str(e))
+        try:
+            if len(parts) != 1 or parts[0].field_name != "file":
+                raise ApiError(400, "缺少上传文件字段 file（且一次只能上传一个文件）")
+            part = parts[0]
+            raw_base = fields.get("base_version", "")
+            if isinstance(raw_base, str) and re.fullmatch(r"\d+", raw_base.strip()):
+                base_version = int(raw_base.strip())
+            else:
+                raise ApiError(400, "缺少 base_version（用于并发版本校验）")
+            description = fields.get("description", "")
+            try:
+                filename, description = attachments.validate_metadata(
+                    part.filename, description)
+            except attachments.UploadError as e:
+                raise ApiError(400, str(e))
+            try:
+                sha256, size, content_type = attachments.validate_staged_file(
+                    part.path, filename)
+            except attachments.UploadError as e:
+                raise ApiError(400, str(e))
+            try:
+                new_version, view = db.add_event_attachment(
+                    DB_PATH, rid, base_version, event_uid, filename, description,
+                    content_type, size, sha256, part.path)
+            except db.AttachmentRejected as e:
+                raise ApiError(400, str(e))
+            bundle = db.get_bundle(DB_PATH, rid)
+            bundle["added_attachment"] = view
+            bundle["new_version"] = new_version
+            self._send_json(201, bundle)
+        finally:
+            attachments.cleanup_parts(parts)
+
+    def _handle_attachment_remove(self, rid, attachment_id):
+        body = self._read_json()
+        base_version = body.get("base_version")
+        if not isinstance(base_version, int) or isinstance(base_version, bool):
+            raise ApiError(400, "缺少 base_version（用于并发版本校验）")
+        db.remove_event_attachment(DB_PATH, rid, base_version, attachment_id)
+        self._send_json(200, db.get_bundle(DB_PATH, rid))
 
     def _dispatch(self, method):
         path = self.path.split("?", 1)[0].rstrip("/") or "/"
@@ -397,6 +486,39 @@ class Handler(BaseHTTPRequestHandler):
                     })
                 return self._send_json(200, db.get_bundle(DB_PATH, rid))
 
+            # 附件：上传（multipart/form-data）
+            m = re.fullmatch(r"/api/reviews/(\d+)/events/([0-9a-fA-F]{8,64})/attachments", path)
+            if m and method == "POST":
+                return self._handle_attachment_upload(
+                    int(m.group(1)), m.group(2).lower())
+
+            # 附件：移除当前关联（旧版本快照不动）
+            m = re.fullmatch(r"/api/reviews/(\d+)/attachments/(\d+)", path)
+            if m and method == "DELETE":
+                return self._handle_attachment_remove(
+                    int(m.group(1)), int(m.group(2)))
+
+            # 附件：下载当前附件原件
+            m = re.fullmatch(r"/api/reviews/(\d+)/attachments/(\d+)/download", path)
+            if m and method == "GET":
+                try:
+                    fpath, row, _blob = db.get_current_attachment(
+                        DB_PATH, int(m.group(1)), int(m.group(2)))
+                except db.AttachmentNotFound:
+                    raise ApiError(404, "附件不存在或文件已不可用")
+                return self._send_attachment_download(fpath, row)
+
+            # 附件：下载某历史版本留存的原件（移除当前附件后旧版本仍可下载）
+            m = re.fullmatch(
+                r"/api/reviews/(\d+)/versions/(\d+)/attachments/(\d+)/download", path)
+            if m and method == "GET":
+                try:
+                    fpath, row = db.get_version_attachment(
+                        DB_PATH, int(m.group(1)), int(m.group(2)), int(m.group(3)))
+                except db.AttachmentNotFound:
+                    raise ApiError(404, "附件不存在或文件已不可用")
+                return self._send_attachment_download(fpath, row)
+
             raise ApiError(404, "not found")
         except ApiError as e:
             self._send_json(e.status, e.payload)
@@ -418,6 +540,8 @@ class Handler(BaseHTTPRequestHandler):
             self._send_json(400, {"error": str(e)})
         except db.FinalizeRejected as e:
             self._send_json(400, {"error": str(e)})
+        except db.AttachmentNotFound:
+            self._send_json(404, {"error": "附件不存在或文件已不可用"})
 
     def do_GET(self):
         self._dispatch("GET")

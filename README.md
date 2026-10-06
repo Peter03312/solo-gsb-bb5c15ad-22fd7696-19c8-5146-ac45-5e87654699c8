@@ -101,6 +101,28 @@
   - 旧库**缺快照的历史版本明确拒绝（HTTP 422）**，复盘或版本不存在报
     **404**；网页在当前结果区与版本回看弹窗的冲突卡片上提供入口。
   对应接口：`GET /api/reviews/{id}/versions/{v}/diagnosis`。
+- **事故现场附件（本轮新增）**：为事件留存现场日志、截图等证据，审阅者可在
+  **历史版本中看到并下载当时的附件原件**。
+  - 已保存的事件可上传**文本（.txt/.log/.md/.csv/.json）、PNG、JPEG
+    （.jpg/.jpeg）或 PDF**，**单文件不超过 20MB**，并填写说明（最多 1000 字）；
+    可查看**文件名、大小、SHA-256**并下载。扩展名声明与内容魔数**必须一致**
+    （把文本改名 .png、把二进制改名 .txt、空文件、不支持的类型、超限一律
+    **拒绝 HTTP 400，且不留下任何文件**，也不产生新版本）。
+  - 附件关联事件的**持续身份（uid）**：事件改名、普通“保存并重新推算”后
+    关联继续保留；删除事件时其当前附件关联随之移除（只影响新版本）。
+  - **移除当前附件只影响新版本**：`snapshot_attachments` 留存每个版本冻结的
+    附件集合，旧版本里的附件仍可通过版本下载地址取回原件。
+  - **恢复历史版本**时以**该版附件集合**生成新草稿（旧快照无附件视为空）；
+    **跨复盘并入**时仅复制**入选事件**的附件关联到复制事件的全新身份，文件
+    按 SHA-256 内容寻址共享，**来源复盘删除后目标仍可下载原件**。
+  - 所有附件变更（上传/移除）都必须携带当前 `base_version`，**原子另存新版本**
+    （版本类型 `attachment`）：过期返回 **409**；失败不产生部分版本或孤儿文件。
+    blob 仅在**没有任何当前或历史引用**时才清理（事务提交后删文件，启动时再
+    扫描一次崩溃残留）。旧快照没有附件的版本视为**空附件集合**。
+  - 存储位置可用 `ATTACH_DIR` 配置，默认为数据库同目录的 `attachments/`
+    （容器内默认 `/data/attachments`，随 `/data` 卷持久化）；相同内容只占一份磁盘。
+  - 网页在事件表「现场附件」列上传/移除/下载（新事件需先保存），版本回看弹窗
+    分组列出该版附件，版本列表带 📎 附件数，并入选择与预览显示将复制的附件。
 
 ## 容器启动
 
@@ -127,6 +149,7 @@ docker run -d -p 8000:8000 -v retro-timeline-data:/data --name retro-timeline re
 | `PORT` | `8000` | 服务监听端口。Compose 中同时用于宿主机映射：`PORT=9000 docker compose up` 后访问 `http://localhost:9000` |
 | `HOST` | `0.0.0.0` | 监听地址 |
 | `DB_PATH` | `/data/timeline.db` | SQLite 数据库文件路径。容器内 `/data` 为挂载卷，删除容器数据不丢失 |
+| `ATTACH_DIR` | `/data/attachments`（本地开发默认为数据库同目录 `attachments/`） | 事故现场附件文件目录（按 SHA-256 内容寻址存储）。容器内位于 `/data` 卷中，随数据库一起持久化 |
 
 Compose 示例（`docker-compose.yml`）中已包含命名卷 `timeline-data` 用于持久化；
 如改用宿主机目录，可将卷替换为 `./data:/data`。
@@ -148,6 +171,9 @@ python3 tests/test_merge_api.py # 并入 HTTP API 端到端测试（预览/确�
 python3 tests/test_merge_origin.py # 并入事件来源摘要测试（来源与新身份绑定、再保存/恢复/对照保留、来源删除后仍显示、非并入事件无来源）
 python3 tests/test_diagnose.py  # 冲突最小约束组分析单元测试（差分约束负环、极小性、时区绝对分钟、排除项、稳定性）
 python3 tests/test_api_diagnose.py # 冲突分析 HTTP API 端到端测试（极小组、空组、404/422、只读、暂存排除）
+python3 tests/test_attachments.py   # 附件存储/校验单元测试（类型魔数嗅探、20MB、内容寻址去重、multipart 解析与清理）
+python3 tests/test_attachments_db.py # 附件持久化测试（上传新版本、改名/删事件保留与裁剪、移除只影响新版本、恢复附件集合、并入复制、GC、409/400/404、无孤儿）
+python3 tests/test_attachments_api.py # 附件 HTTP API 端到端测试（multipart 上传/下载、拒绝不留文件、版本下载、409、并入携带附件）
 ```
 
 > 跨地区时区依赖系统 IANA 时区库（Python 标准库 `zoneinfo` 读取
@@ -171,6 +197,10 @@ python3 tests/test_api_diagnose.py # 冲突分析 HTTP API 端到端测试（极
 | GET | `/api/reviews/{id}/compare?from={v1}&to={v2}` | 两版本对照（只读）：须 `v1 < v2`；顺序无效 400、版本不存在 404、旧库无快照 422 |
 | POST | `/api/reviews/{id}/merge/preview` | 并入预览（只读）：`{source_review_id, source_version, event_uids}`；返回复制事件（每个带 `origin` 来源摘要）、两端均入选的关系、合并后推算结论与 `digest`；来源/目标相同 400、事件不存在 400、来源缺快照 422、复盘或版本不存在 404 |
 | POST | `/api/reviews/{id}/merge/confirm` | 确认并入，一次性另存为目标新草稿版本：`{source_review_id, source_version, event_uids, base_version, digest}`；复制事件取得全新 uid 且其 `origin` 保存来源复盘/版本/来源事件身份与名称（之后保存、恢复不丢失；来源被删后仍显示保存摘要）；目标过期 409、digest 与预览不符 400 |
+| POST | `/api/reviews/{id}/events/{uid}/attachments` | 为已保存事件上传现场附件（`multipart/form-data`：字段 `file` + `description` + `base_version`）；文本/PNG/JPEG/PDF、≤20MB、扩展名与内容一致，成功返回新快照（`kind=attachment` 新版本）；类型/大小不符 400 且不留文件，`base_version` 过期 409，事件不存在 400 |
+| DELETE | `/api/reviews/{id}/attachments/{aid}` | 移除当前附件关联（只影响新版本，旧版本快照仍可下载）：`{base_version}`；过期 409、附件不存在 404 |
+| GET | `/api/reviews/{id}/attachments/{aid}/download` | 下载当前附件原件（带 `Content-Type`、原始文件名 `Content-Disposition`、`X-SHA-256`） |
+| GET | `/api/reviews/{id}/versions/{v}/attachments/{aid}/download` | 下载某历史版本留存的附件原件（移除当前附件/删除事件后旧版本仍可取回） |
 | DELETE | `/api/reviews/{id}` | 删除复盘 |
 
 ### 版本回看与恢复（HTTP 示例）
@@ -423,6 +453,99 @@ curl -s -X POST http://localhost:8000/api/reviews/2/merge/confirm \
 - `origin` 纯展示：不参与 digest，不进入推算，目标事件输入与推算窗口、冲突/
   暂存结论均不因来源展示而改变。
 
+### 事故现场附件（本轮新增，HTTP 示例）
+
+为**已保存的事件**（持有服务端下发的持续身份 `uid`）上传/移除/下载现场附件。
+上传是 `multipart/form-data`：文件字段名固定为 `file`，另有普通字段
+`description`（说明，可空）与 `base_version`（必填，过期 409）。附件变更与保存
+一样**原子另存新版本**（版本类型 `attachment`）。
+
+```bash
+# 0) 先取得事件 uid（新建并保存事件）
+curl -s -X PUT http://localhost:8000/api/reviews/1 \
+  -H 'Content-Type: application/json' -d '{
+    "base_version": 1, "title": "支付故障复盘",
+    "events": [{"key":"a","uid":"","name":"告警触发",
+      "earliest_start":"2026-10-01T10:00","latest_start":"2026-10-01T10:00",
+      "duration_minutes":15}],
+    "relations": []}'
+# -> events[0].uid = "3f1a…"，review.version = 2
+
+# 1) 上传现场日志（文本，curl 用 -F 发送 multipart；务必带 base_version）
+curl -s -X POST http://localhost:8000/api/reviews/1/events/3f1a…/attachments \
+  -F base_version=2 \
+  -F 'description=值班同学导出的网关访问日志片段' \
+  -F 'file=@./gateway.log;type=text/plain'
+# 201：返回与 GET /api/reviews/1 相同的新快照（version=3, kind 在下一条快照）：
+# {"review": {"version": 3, ...},
+#  "events": [...], "relations": [],
+#  "attachments": [{
+#    "id": 1, "review_id": 1, "event_uid": "3f1a…",
+#    "filename": "gateway.log", "description": "值班同学导出的网关访问日志片段",
+#    "content_type": "text/plain; charset=utf-8", "size": 4821,
+#    "blob_sha256": "9f2c…（64 位 SHA-256）",
+#    "uploaded_at": "2026-10-06T15:20:11",
+#    "download_url": "/api/reviews/1/attachments/1/download"}],
+#  "computation": {...}}
+
+# 同样可上传截图 / PDF（类型按内容魔数判定）：
+curl -s -X POST http://localhost:8000/api/reviews/1/events/3f1a…/attachments \
+  -F base_version=3 -F 'description=02:03 监控大盘截图' \
+  -F 'file=@./dashboard.png;type=image/png'
+curl -s -X POST http://localhost:8000/api/reviews/1/events/3f1a…/attachments \
+  -F base_version=4 -F 'description=事后补充的工单 PDF' \
+  -F 'file=@./ticket.pdf;type=application/pdf'
+
+# 2) 查看当前附件（名称/大小/SHA-256）与下载
+curl -s http://localhost:8000/api/reviews/1 | python3 -m json.tool | grep -A3 attachments
+curl -s -OJ http://localhost:8000/api/reviews/1/attachments/1/download
+# 响应头：Content-Type、Content-Disposition（原始文件名）、X-SHA-256
+
+# 3) 历史版本中审阅者看到“当时的附件”
+curl -s http://localhost:8000/api/reviews/1/versions/3
+# {"version":3,"kind":"attachment",...,"attachment_count":1,
+#  "input":{"events":[...],"relations":[],"attachments":[{
+#    "id":1,"event_uid":"3f1a…","filename":"gateway.log","size":4821,
+#    "blob_sha256":"9f2c…","uploaded_at":"2026-10-06T15:20:11",
+#    "download_url":"/api/reviews/1/versions/3/attachments/1/download", ...}], ...}}
+curl -s -OJ http://localhost:8000/api/reviews/1/versions/3/attachments/1/download
+
+# 4) 移除当前附件：只影响新版本（version=6），v3~v5 旧版本仍可下载原件
+curl -s -X DELETE http://localhost:8000/api/reviews/1/attachments/1 \
+  -H 'Content-Type: application/json' -d '{"base_version": 5}'
+# -> 200 新快照，attachments 为空；GET /versions/3 仍含该附件且可下载
+# base_version 过期 -> 409；附件 id 不存在 -> 404
+
+# 5) 恢复历史版本：以该版附件集合生成新草稿
+curl -s -X POST http://localhost:8000/api/reviews/1/versions/3/restore \
+  -H 'Content-Type: application/json' -d '{"base_version": 6}'
+# -> 200，当前附件集合恢复为 v3 的集合（gateway.log 重新出现在 attachments）
+
+# 6) 错误路径（均不产生新版本、不留下文件）
+# 把文本改名成图片 / 二进制改成 .txt：
+curl -s -X POST http://localhost:8000/api/reviews/1/events/3f1a…/attachments \
+  -F base_version=6 -F 'file=@./gateway.log;filename=fake.png;type=image/png'
+# 400 {"error":"附件内容与扩展名 .png 不符：实际内容为 text/plain; charset=utf-8，拒绝上传"}
+# 不支持的类型：.exe / .doc / .zip ...
+# 400 {"error":"不支持的附件类型：仅支持文本（.txt/.log/.md/.csv/.json）、PNG（.png）、JPEG（.jpg/.jpeg）或 PDF（.pdf）"}
+# 超过 20MB：400 {"error":"附件超过 20MB 上限（实际 20971521 字节），拒绝上传"}
+# 空文件、缺 file 字段、缺 base_version、事件 uid 不存在：400
+# 事件 uid 存在但 base_version 已过期：409 {"current_version": ...}
+```
+
+附件跟随事件的**持续身份**：事件改名、普通“保存并重新推算”后附件关联保留；
+删除事件会移除其**当前**关联并产生新版本，但含该事件附件的旧版本仍可下载。
+`GET /api/reviews/{id}` 的 `attachments` 为当前附件列表；
+`GET .../versions` 每条版本带 `attachment_count`；
+`GET .../versions/{v}` 的 `input.attachments` 是该版本冻结的附件（含版本下载
+地址）。文件按 SHA-256 去重存储，仅在**当前关联与所有历史快照都无引用**时
+（例如删除整个复盘后）才清理磁盘文件；服务重启不影响任何已保存附件。
+
+并入其他复盘时，预览响应的 `copied_events[].attachments` 与
+`copied_attachments`（及 `copied_attachment_count`）列出每个入选事件将复制的
+附件关联；确认并入后这些关联挂到复制事件的**全新 uid**上（文件共享），来源
+复盘或来源版本随后删除，目标当前与历史版本仍可下载。
+
 ### “先于”关系的间隔设置（HTTP 示例）
 
 每条关系可携带 `min_gap_minutes`（最短等待，非负整数分钟，缺省 0）与
@@ -590,6 +713,7 @@ app/
   diagnose.py        版本冲突最小不可满足约束组分析（差分约束图负环、删除式收缩保证极小性，只读）
   tzutil.py          IANA 时区与带偏移当地时间校验（夏令时 gap/重复时刻）、按时区展示
   compare.py         版本对照：跨版本按 uid 配对与差值计算（纯函数，只读）
+  attachments.py     事故现场附件：内容寻址（SHA-256）文件存储、类型/大小/魔数校验、multipart 解析、孤儿清理
   static/            浏览器单页界面（原生 HTML/JS/CSS）
 tests/test_compute.py  推算引擎单元测试
 tests/test_versions.py 版本快照/回看/恢复与旧库兼容测试
@@ -603,5 +727,8 @@ tests/test_merge_api.py 并入 HTTP API 端到端测试（预览/确认、错误
 tests/test_merge_origin.py 并入事件来源摘要测试（来源与新身份绑定、再保存/恢复/对照保留、来源删除后仍显示）
 tests/test_diagnose.py 冲突最小约束组分析单元测试（负环、极小性、时区绝对分钟、排除项、稳定性）
 tests/test_api_diagnose.py 冲突分析 HTTP API 端到端测试（极小组、空组、404/422、只读、暂存排除）
+tests/test_attachments.py 附件存储/校验/multipart 单元测试
+tests/test_attachments_db.py 附件持久化测试（快照留存、恢复、并入复制、GC、无孤儿文件）
+tests/test_attachments_api.py 附件 HTTP API 端到端测试（上传/下载/移除/拒绝路径）
 Dockerfile / docker-compose.yml / .dockerignore
 ```

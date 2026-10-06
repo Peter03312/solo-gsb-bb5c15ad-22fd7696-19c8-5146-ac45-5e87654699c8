@@ -3,7 +3,8 @@ FROM python:3.12-slim
 ENV PYTHONUNBUFFERED=1 \
     HOST=0.0.0.0 \
     PORT=8000 \
-    DB_PATH=/data/timeline.db
+    DB_PATH=/data/timeline.db \
+    ATTACH_DIR=/data/attachments
 
 WORKDIR /app
 COPY app/ /app/

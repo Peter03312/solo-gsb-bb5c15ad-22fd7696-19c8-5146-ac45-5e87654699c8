@@ -198,3 +198,31 @@ table.cmp th, table.cmp td { padding: 4px 6px; }
 .dg-constraints li { margin-bottom: 6px; }
 .dg-type { display: inline-block; font-size: 11px; color: var(--accent); margin-bottom: 2px; }
 .dg-time { font-family: ui-monospace, monospace; font-size: 12px; color: var(--accent); white-space: nowrap; }
+
+/* 事故现场附件 */
+.att-cell { min-width: 220px; max-width: 280px; }
+.att-box { display: flex; flex-direction: column; gap: 6px; }
+.att-list { display: flex; flex-direction: column; gap: 6px; }
+.att-empty { font-size: 12px; }
+.att-item {
+  border: 1px solid var(--border); border-radius: 6px; padding: 5px 8px;
+  background: var(--panel2); font-size: 12px; position: relative;
+}
+.att-name { color: var(--accent); text-decoration: none; word-break: break-all; }
+.att-name:hover { text-decoration: underline; }
+.att-meta { font-size: 11px; margin-top: 2px; word-break: break-all; }
+.att-meta code { font-size: 10px; color: var(--muted); }
+.att-desc { margin-top: 3px; color: var(--text); }
+.att-del {
+  margin-top: 4px; padding: 2px 8px; font-size: 11px;
+}
+.att-upload { display: flex; flex-direction: column; gap: 4px; margin-top: 4px; }
+.att-upload input[type="file"] { font-size: 11px; padding: 3px; }
+.att-desc-input { width: 100%; }
+.att-upload-btn { align-self: flex-start; padding: 3px 10px; font-size: 12px; }
+.att-count {
+  font-size: 11px; padding: 1px 7px; border-radius: 9px;
+  border: 1px solid var(--border); color: var(--accent); white-space: nowrap;
+}
+.vm-attachments .vm-att-list { display: flex; flex-direction: column; gap: 6px; }
+#events-table th:nth-child(7), #events-table td:nth-child(7) { min-width: 230px; }

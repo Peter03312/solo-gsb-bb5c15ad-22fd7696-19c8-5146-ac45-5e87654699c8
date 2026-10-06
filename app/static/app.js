@@ -5,7 +5,7 @@ const $ = (sel) => document.querySelector(sel);
 
 const state = {
   reviews: [],
-  current: null,      // 服务器返回的复盘快照 {review, events, relations, computation}
+  current: null,      // 服务器返回的复盘快照 {review, events, relations, attachments, computation}
   editEvents: [],     // 编辑中的事件 [{key, id?, name, earliest_start, latest_start, duration_minutes, note}]
   editRelations: [],  // 编辑中的关系 [{predecessor_key, successor_key, min_gap_minutes, max_gap_minutes}]
   seq: 0,
@@ -95,6 +95,200 @@ function resetEdits() {
   })).filter((r) => r.predecessor_key && r.successor_key);
 }
 
+/* ------------------------------------------------------------ 附件（现场证据） */
+
+function attachmentsByEvent() {
+  const map = {};
+  for (const a of (state.current.attachments || [])) {
+    (map[a.event_uid] = map[a.event_uid] || []).push(a);
+  }
+  return map;
+}
+
+function fmtSize(n) {
+  if (n === null || n === undefined) return "";
+  if (n < 1024) return n + " B";
+  if (n < 1024 * 1024) return (n / 1024).toFixed(1) + " KB";
+  return (n / (1024 * 1024)).toFixed(2) + " MB";
+}
+
+function shortSha(sha) {
+  return sha ? sha.slice(0, 8) + "…" + sha.slice(-6) : "";
+}
+
+/* 客户端预检（服务端仍会强校验）：类型与 20MB 上限，避免明显无效的上传往返 */
+const ALLOWED_ATT_EXT = /\.(txt|log|md|csv|json|png|jpg|jpeg|pdf)$/i;
+function checkAttachmentFile(file) {
+  if (!file) return "请选择要上传的文件";
+  if (!ALLOWED_ATT_EXT.test(file.name)) {
+    return "仅支持文本（.txt/.log/.md/.csv/.json）、PNG、JPEG 或 PDF";
+  }
+  if (file.size === 0) return "不允许上传空文件";
+  if (file.size > 20 * 1024 * 1024) return "单文件不得超过 20MB（当前 " + fmtSize(file.size) + "）";
+  return null;
+}
+
+function attachmentListHtml(atts) {
+  if (!atts || !atts.length) return `<div class="hint att-empty">无附件</div>`;
+  return atts.map((a) =>
+    `<div class="att-item" data-att="${a.id}">` +
+      `<a class="att-name" href="${a.download_url}" title="下载 ${escapeHtml(a.filename)}" download="${escapeHtml(a.filename)}">${fileIcon(a)} ${escapeHtml(a.filename)}</a>` +
+      `<div class="att-meta hint" title="SHA-256：${a.blob_sha256}">${fmtSize(a.size)} · <code>${shortSha(a.blob_sha256)}</code>` +
+      (a.uploaded_at ? ` · ${escapeHtml(String(a.uploaded_at).replace("T", " "))}` : "") + `</div>` +
+      (a.description ? `<div class="att-desc">${escapeHtml(a.description)}</div>` : "") +
+      `<button class="att-del danger" title="移除当前附件（旧版本仍保留可下载）">移除</button>` +
+    `</div>`).join("");
+}
+
+function fileIcon(a) {
+  const ct = a.content_type || "";
+  if (ct.startsWith("image/")) return "🖼️";
+  if (ct === "application/pdf") return "📄";
+  return "📝";
+}
+
+function renderAttachmentCell(td, e) {
+  const grouped = attachmentsByEvent();
+  td.innerHTML = `<div class="att-box"></div>`;
+  const box = td.querySelector(".att-box");
+  const atts = grouped[e.uid] || [];
+  const list = document.createElement("div");
+  list.className = "att-list";
+  list.innerHTML = attachmentListHtml(atts);
+  box.appendChild(list);
+
+  const bar = document.createElement("div");
+  bar.className = "att-upload";
+  if (!e.uid) {
+    // 尚未保存的事件没有服务端持续身份：不能上传附件
+    bar.innerHTML = `<span class="hint">保存事件后可上传附件</span>`;
+  } else {
+    const input = document.createElement("input");
+    input.type = "file";
+    input.accept = ".txt,.log,.md,.csv,.json,.png,.jpg,.jpeg,.pdf";
+    const desc = document.createElement("input");
+    desc.type = "text";
+    desc.placeholder = "附件说明（可选）";
+    desc.className = "att-desc-input";
+    const btn = document.createElement("button");
+    btn.className = "att-upload-btn";
+    btn.textContent = "⬆ 上传";
+    btn.addEventListener("click", () => uploadAttachment(e, input.files[0], desc.value, btn));
+    bar.appendChild(input);
+    bar.appendChild(desc);
+    bar.appendChild(btn);
+  }
+  box.appendChild(bar);
+
+  td.querySelectorAll(".att-del").forEach((btn) => {
+    btn.addEventListener("click", () => {
+      const item = btn.closest(".att-item");
+      const id = parseInt(item.dataset.att, 10);
+      const att = (state.current.attachments || []).find((x) => x.id === id);
+      if (!att) return;
+      if (!confirm(`移除附件「${att.filename}」吗？\n只会影响新保存的版本；历史版本中该附件仍保留、可下载。`)) return;
+      removeAttachment(id, btn);
+    });
+  });
+}
+
+/* 当前表单（editEvents/editRelations）相对已保存状态是否有未保存改动 */
+function hasUnsavedEdits() {
+  const cur = state.current;
+  if (!cur) return false;
+  const idToKey = {};
+  for (const ev of cur.events) idToKey[ev.id] = "id_" + ev.id;
+  const savedRels = (cur.relations || []).map((r) => ({
+    predecessor_key: idToKey[r.predecessor_id],
+    successor_key: idToKey[r.successor_id],
+    min_gap_minutes: r.min_gap_minutes,
+    max_gap_minutes: r.max_gap_minutes === null ? "" : r.max_gap_minutes,
+  }));
+  if (state.editEvents.length !== cur.events.length) return true;
+  for (const e of state.editEvents) {
+    const s = cur.events.find((x) => ("id_" + x.id) === e.key);
+    if (!s) return true;
+    if ((e.name || "") !== (s.name || "")) return true;
+    if ((e.timezone || "") !== (s.timezone || "")) return true;
+    if ((e.earliest_start || "") !== (s.earliest_start || "")) return true;
+    if ((e.latest_start || "") !== (s.latest_start || "")) return true;
+    const ed = e.duration_minutes === "" ? null : e.duration_minutes;
+    if (ed !== s.duration_minutes) return true;
+    if ((e.note || "") !== (s.note || "")) return true;
+  }
+  if (state.editRelations.length !== savedRels.length) return true;
+  for (let i = 0; i < state.editRelations.length; i++) {
+    const a = state.editRelations[i], b = savedRels[i];
+    if (a.predecessor_key !== b.predecessor_key || a.successor_key !== b.successor_key) return true;
+    if ((a.min_gap_minutes === "" ? 0 : a.min_gap_minutes) !== b.min_gap_minutes) return true;
+    if ((a.max_gap_minutes === "" ? "" : a.max_gap_minutes) !== b.max_gap_minutes) return true;
+  }
+  return false;
+}
+
+/* 附件操作成功后刷新：表单无未保存改动时仅同步版本/附件数据并重绘（输入保留）；
+   有改动时重置为服务器新快照并提示旧表单改动需重新录入（附件已另存新版本）。 */
+function refreshAfterAttachmentChange(bundle) {
+  const keepForm = !hasUnsavedEdits();
+  state.current = bundle;
+  if (keepForm) {
+    render();  // renderEventsTable 重建输入，但值取自 editEvents（未变）
+  } else {
+    resetEdits();
+    showBanner("附件已另存为新版本；表单里尚未保存的事件/关系修改未包含在该版本中，请按需重新编辑保存。");
+    render();
+  }
+  loadVersions();
+  loadReviews(bundle.review.id);
+}
+
+/* 上传/移除都是独立的保存动作：以当前 base_version 原子另存新版本。
+   成功后只刷新服务器状态并重绘附件/徽标，不清空正在编辑的事件表单输入。 */
+async function uploadAttachment(e, file, description, btn) {
+  const problem = checkAttachmentFile(file);
+  if (problem) { showBanner("⚠ " + escapeHtml(problem)); return; }
+  // 附件操作基于已保存版本另存新版本；先收起表单中对已保存事件的改名/时间修改
+  // 到编辑态（未保存的新事件行本来就不能传附件，需要先点“保存并重新推算”）。
+  syncFromDOM();
+  const rid = state.current.review.id;
+  const fd = new FormData();
+  fd.append("base_version", String(state.current.review.version));
+  if (description) fd.append("description", description.trim().slice(0, 1000));
+  fd.append("file", file, file.name);
+  btn.disabled = true;
+  try {
+    const resp = await fetch(`/api/reviews/${rid}/events/${e.uid}/attachments`,
+                             { method: "POST", body: fd });
+    const data = await resp.json().catch(() => ({}));
+    if (!resp.ok) {
+      const err = new Error(data.error || ("HTTP " + resp.status));
+      err.status = resp.status; err.data = data;
+      throw err;
+    }
+    hideBanner();
+    refreshAfterAttachmentChange(data);
+  } catch (err) {
+    handleSaveError(err);
+  } finally {
+    btn.disabled = false;
+  }
+}
+
+async function removeAttachment(id, btn) {
+  btn.disabled = true;
+  try {
+    const data = await api("DELETE",
+      `/api/reviews/${state.current.review.id}/attachments/${id}`,
+      { base_version: state.current.review.version });
+    hideBanner();
+    refreshAfterAttachmentChange(data);
+  } catch (err) {
+    handleSaveError(err);
+  } finally {
+    btn.disabled = false;
+  }
+}
+
 /* ---------------------------------------------------------------- 渲染 */
 
 function eventName(key) {
@@ -166,6 +360,7 @@ function renderEventsTable() {
       `<td>${timeInputHtml("latest_start", e.timezone)}</td>` +
       `<td><input data-f="duration_minutes" type="number" min="0" style="width:80px"></td>` +
       `<td><input data-f="note" type="text"></td>` +
+      `<td class="att-cell"></td>` +
       `<td><button class="row-del" title="删除事件">✕</button></td>`;
     tr.querySelector('[data-f="name"]').value = e.name;
     tr.querySelector('[data-f="timezone"]').value = e.timezone;
@@ -173,6 +368,7 @@ function renderEventsTable() {
     tr.querySelector('[data-f="latest_start"]').value = e.latest_start;
     tr.querySelector('[data-f="duration_minutes"]').value = e.duration_minutes;
     tr.querySelector('[data-f="note"]').value = e.note;
+    renderAttachmentCell(tr.querySelector(".att-cell"), e);
     // 时区改变会改变时间输入的形态（朴素 vs 带偏移）：先同步 DOM 再整体重绘
     tr.querySelector('[data-f="timezone"]').addEventListener("change", () => {
       syncFromDOM();
@@ -496,6 +692,7 @@ async function loadVersions() {
     let html = `<td>v${v.version}${cur ? ' <span class="kind-tag">当前</span>' : ""}</td>`;
     html += `<td>${kindTag(v)}</td>`;
     html += `<td>${statusText(v)}</td>`;
+    html += `<td>${v.attachment_count ? `<span class="att-count" title="该版本留存 ${v.attachment_count} 个现场附件">📎 ${v.attachment_count}</span>` : '<span class="hint">—</span>'}</td>`;
     html += `<td class="hint">${(v.computed_at || "").replace("T", " ")}</td>`;
     html += `<td class="version-actions"></td>`;
     tr.innerHTML = html;
@@ -539,6 +736,7 @@ function kindTag(v) {
   if (v.kind === "finalize") return `<span class="kind-tag finalize">已定稿</span>`;
   if (v.kind === "merge") return `<span class="kind-tag restore">并入产生</span>`;
   if (v.kind === "restore") return `<span class="kind-tag restore">恢复产生</span>`;
+  if (v.kind === "attachment") return `<span class="kind-tag restore">附件变更</span>`;
   if (v.kind === "save") return `<span class="kind-tag">保存</span>`;
   return `<span class="kind-tag">历史记录</span>`;
 }
@@ -585,6 +783,8 @@ function renderVersionDetail(detail) {
   const events = detail.input.events || [];
   const byKey = {};
   for (const e of events) byKey[e.key] = e;
+  const nameByUid = {};
+  for (const e of events) nameByUid[e.uid] = e.name;
 
   const rows = events.map((e) =>
     `<tr><td>${escapeHtml(e.name)}${originBadgeHtml(e.origin)}</td>` +
@@ -601,6 +801,22 @@ function renderVersionDetail(detail) {
     return `<div>「${escapeHtml(an)}」先于「${escapeHtml(bn)}」${escapeHtml(gapText(r))}</div>`;
   }).join("") || `<div class="hint">无</div>`;
 
+  // 该版本留存的现场附件（不可变快照）：审阅者看到并下载当时的原件
+  const atts = detail.input.attachments || [];
+  let attsHtml;
+  if (!atts.length) {
+    attsHtml = `<div class="hint">无附件</div>`;
+  } else {
+    attsHtml = `<div class="vm-att-list">` + atts.map((a) =>
+      `<div class="att-item">` +
+        `<div>事件：「${escapeHtml(nameByUid[a.event_uid] || "（已删除事件）")}」</div>` +
+        `<a class="att-name" href="${a.download_url}" download="${escapeHtml(a.filename)}">${fileIcon(a)} ${escapeHtml(a.filename)}</a>` +
+        `<div class="att-meta hint" title="SHA-256：${a.blob_sha256}">${fmtSize(a.size)} · <code>${shortSha(a.blob_sha256)}</code>` +
+        (a.uploaded_at ? ` · ${escapeHtml(String(a.uploaded_at).replace("T", " "))}` : "") + `</div>` +
+        (a.description ? `<div class="att-desc">${escapeHtml(a.description)}</div>` : "") +
+      `</div>`).join("") + `</div>`;
+  }
+
   // 快照事件以 id_<旧行id> 为 key，推算结果窗口仍以旧行 id 为键
   const winIndex = {};
   for (const e of events) winIndex[String(e.key).replace(/^id_/, "")] = e;
@@ -609,6 +825,8 @@ function renderVersionDetail(detail) {
     `<table><thead><tr><th>事件名称</th><th>时区</th><th>最早开始</th><th>最晚开始</th>` +
     `<th>持续(分钟)</th><th>备注</th></tr></thead><tbody>${rows}</tbody></table>` +
     `<div class="section-title">“先于”关系</div><div class="vm-relations">${rels}</div>` +
+    `<div class="section-title">现场附件（${atts.length} 个，随该版本留存，可下载原件）</div>` +
+    `<div class="vm-attachments">${attsHtml}</div>` +
     `<div class="section-title">当时推算依据与结果</div>` +
     parts.summary + parts.conflicts + parts.drafts + parts.skipped + parts.windows;
 }
@@ -913,14 +1131,19 @@ function renderMergePicker() {
   for (const e of events) uidByKey[e.key] = e.uid;
   const nameByUid = {};
   for (const e of events) nameByUid[e.uid] = e.name;
+  const attsByUid = {};
+  for (const a of (detail.input.attachments || [])) {
+    (attsByUid[a.event_uid] = attsByUid[a.event_uid] || []).push(a);
+  }
 
   const rows = events.map((e) => {
     const checked = selected.has(e.uid) ? " checked" : "";
     const draft = (!e.earliest_start || !e.latest_start || e.duration_minutes === null
       || e.duration_minutes === undefined);
+    const nAtt = (attsByUid[e.uid] || []).length;
     return `<tr data-uid="${escapeHtml(e.uid || "")}">` +
       `<td><input type="checkbox" class="mp-check"${checked}${e.uid ? "" : " disabled"}></td>` +
-      `<td>${escapeHtml(e.name)}</td>` +
+      `<td>${escapeHtml(e.name)}${nAtt ? ` <span class="att-count" title="该事件在来源版本留存 ${nAtt} 个附件，入选后将复制附件关联">📎 ${nAtt}</span>` : ""}</td>` +
       `<td>${escapeHtml(e.timezone || "")}</td>` +
       `<td>${fmtTime(e.earliest_start)}</td>` +
       `<td>${fmtTime(e.latest_start)}</td>` +
@@ -1017,13 +1240,31 @@ function renderMergeModal(data) {
     `来源历史与目标原有事件均不改变；复制事件在目标取得全新持续身份。`;
 
   const evRows = data.copied_events.map((e) =>
-    `<tr><td>${escapeHtml(e.name)}</td><td>${escapeHtml(e.timezone || "")}</td>` +
+    `<tr><td>${escapeHtml(e.name)}${(e.attachments || []).length
+        ? ` <span class="att-count" title="将复制 ${e.attachments.length} 个附件关联（文件共享，来源删除后仍可下载）">📎 ${e.attachments.length}</span>`
+        : ""}</td><td>${escapeHtml(e.timezone || "")}</td>` +
     `<td>${fmtTime(e.earliest_start)}</td><td>${fmtTime(e.latest_start)}</td>` +
     `<td>${e.duration_minutes === null || e.duration_minutes === undefined ? "—" : e.duration_minutes}</td>` +
     `<td>${escapeHtml(e.note || "")}</td></tr>`).join("");
   const rels = data.copied_relations.map((r) =>
     `<div>「${escapeHtml(r.predecessor.name || "?")}」先于「${escapeHtml(r.successor.name || "?")}」` +
     `${escapeHtml(gapText(r))}</div>`).join("") || `<div class="hint">无（没有两端均入选的关系）</div>`;
+
+  // 将随入选事件复制的附件关联（只复制关联、文件按内容共享，来源删除后目标仍可下载）
+  const nameByUid = {};
+  for (const e of data.copied_events) nameByUid[e.uid] = e.name;
+  const cpAtts = data.copied_attachments || [];
+  let attsSection;
+  if (!cpAtts.length) {
+    attsSection = "";
+  } else {
+    attsSection = `<div class="section-title">将复制的现场附件关联（${cpAtts.length} 个，` +
+      `只复制关联到新事件身份；文件共享，来源删除后目标仍可下载）</div><div class="mp-rel">` +
+      cpAtts.map((a) => `<div>📎 「${escapeHtml(nameByUid[a.event_uid] || "?")}」· ${escapeHtml(a.filename)}` +
+        ` <span class="hint">${fmtSize(a.size)} · <code>${shortSha(a.blob_sha256)}</code></span>` +
+        (a.description ? ` <span class="hint">${escapeHtml(a.description)}</span>` : "") + `</div>`).join("") +
+      `</div>`;
+  }
 
   const byKey = mergeResultEvByKey(data);
   const parts = buildResultHtml(data.result, byKey);
@@ -1034,6 +1275,7 @@ function renderMergeModal(data) {
     `<th>最晚开始</th><th>持续(分钟)</th><th>备注</th></tr></thead><tbody>${evRows}</tbody></table>` +
     `<div class="section-title">将复制的“先于”关系（${data.copied_relations.length} 条，保留等待上下界）</div>` +
     `<div class="mp-rel">${rels}</div>` +
+    attsSection +
     `<div class="section-title">合并后的推算结论（预览）</div>` +
     parts.summary + parts.conflicts + parts.drafts + parts.skipped + parts.windows;
   $("#mm-body").innerHTML = body;

@@ -9,6 +9,21 @@ snapshots 记录，留存当时的标题、事件、“先于”关系输入，�
 一一对应。旧库中只有 computations、没有 snapshots 的历史版本视为不可回看、
 不可恢复（也不可作为并入来源），列表中明确标记，绝不用当前输入冒充。
 
+事故现场附件（attachments）
+---------------------------
+- blobs 按 **SHA-256 内容寻址**去重：同一文件跨事件、跨版本、跨复盘只存一份；
+- event_attachments 是附件与事件**持续身份（uid）**的当前关联（含当时上传的
+  文件名/大小/说明/时间）。普通保存、改名不触碰关联；删除事件时随身份清掉
+  当前关联（只影响新版本）；
+- snapshot_attachments 是每个不可变版本留存的附件集合（同时冗余进
+  snapshots.input_json["attachments"]）：移除当前附件、删除事件后，旧版本仍
+  可下载原件；恢复历史版本即以该版附件集合重建当前关联；并入只复制入选事件
+  的关联，来源删除后目标文件仍在（同一 blob 多份引用，GC 不会清理）；
+- 任何写版本的操作（保存/定稿/恢复/并入/上传/移除附件）都在同一事务内核对
+  base_version、替换/复制关联、写快照，失败整体回滚；磁盘文件只在事务内
+  原子改名入库，失败清理临时文件；提交后仅清理“当前关联与所有历史快照均无
+  引用”的 blob，启动时再扫描一次崩溃残留，保证不留孤儿文件。
+
 跨复盘并入（merge）：预览只读组装合并输入并推算；确认在一个事务内完成版本
 核对、digest 核对、整体替换、重新推算与新快照写入（kind=merge，记录来源
 复盘/版本），失败回滚，绝不产生部分写入。复制事件由 _replace_input 分配
@@ -22,7 +37,7 @@ import os
 import sqlite3
 import uuid
 from datetime import datetime
-
+import attachments
 import compare
 import compute
 import diagnose
@@ -78,14 +93,52 @@ CREATE TABLE IF NOT EXISTS snapshots (
     id             INTEGER PRIMARY KEY AUTOINCREMENT,
     review_id      INTEGER NOT NULL REFERENCES reviews(id) ON DELETE CASCADE,
     review_version INTEGER NOT NULL,
-    kind           TEXT NOT NULL,                  -- save | finalize | restore | merge
+    kind           TEXT NOT NULL,                  -- save | finalize | restore | merge | attachment
     title          TEXT NOT NULL,                 -- 不可变的标题快照
-    input_json     TEXT NOT NULL,                 -- 不可变输入：{events, relations}
+    input_json     TEXT NOT NULL,                 -- 不可变输入：{events, relations, attachments}
     source_version INTEGER,                       -- restore/finalize/merge 沿用的来源版本
     source_review_id INTEGER,                     -- merge：来源复盘 id
     created_at     TEXT NOT NULL,
     UNIQUE(review_id, review_version)
 );
+-- 附件内容：按 SHA-256 内容寻址去重存储，文件本体存于存储目录 <sha256>。
+CREATE TABLE IF NOT EXISTS blobs (
+    sha256     TEXT PRIMARY KEY,                   -- 内容哈希（也作为存储文件名）
+    size       INTEGER NOT NULL,                  -- 字节数
+    kind       TEXT NOT NULL,                      -- text | png | jpeg | pdf
+    created_at TEXT NOT NULL
+);
+-- 附件与事件持续身份（uid）的**当前**关联；一个 blob 可被多个事件/复盘关联。
+-- review_id 冗余在关联行上（由 uid 唯一归属该复盘），便于按复盘删除与鉴权。
+CREATE TABLE IF NOT EXISTS event_attachments (
+    id           INTEGER PRIMARY KEY AUTOINCREMENT,
+    review_id    INTEGER NOT NULL REFERENCES reviews(id) ON DELETE CASCADE,
+    event_uid    TEXT NOT NULL,                    -- 事件持续身份：改名/普通保存保留
+    blob_sha256  TEXT NOT NULL REFERENCES blobs(sha256),
+    filename     TEXT NOT NULL,                    -- 上传当时的文件名（展示用副本）
+    description  TEXT NOT NULL DEFAULT '',         -- 上传说明
+    content_type TEXT NOT NULL,
+    size         INTEGER NOT NULL,
+    uploaded_at  TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_event_attachments_review
+    ON event_attachments(review_id);
+-- 每个不可变版本的附件集合留存（与 snapshots 一一对应、随复盘级联删除）。
+-- 旧快照无附件：该表无记录，回看时视为空，绝不回填。
+CREATE TABLE IF NOT EXISTS snapshot_attachments (
+    id             INTEGER PRIMARY KEY AUTOINCREMENT,
+    review_id      INTEGER NOT NULL REFERENCES reviews(id) ON DELETE CASCADE,
+    review_version INTEGER NOT NULL,
+    event_uid      TEXT NOT NULL,
+    blob_sha256    TEXT NOT NULL REFERENCES blobs(sha256),
+    filename       TEXT NOT NULL,
+    description    TEXT NOT NULL DEFAULT '',
+    content_type   TEXT NOT NULL,
+    size           INTEGER NOT NULL,
+    uploaded_at    TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_snapshot_attachments_lookup
+    ON snapshot_attachments(review_id, review_version);
 """
 
 
@@ -117,6 +170,14 @@ class InvalidCompareOrder(Exception):
 
 class MergeRejected(Exception):
     """并入输入不合法：来源/目标相同、事件不存在、选择非法等（HTTP 400）。"""
+
+
+class AttachmentRejected(Exception):
+    """附件操作被拒绝：事件不存在/数量超限/附件不属于该复盘等（HTTP 400）。"""
+
+
+class AttachmentNotFound(Exception):
+    """附件记录不存在或文件本体缺失（HTTP 404）。"""
 
 
 def _now():
@@ -168,8 +229,47 @@ def _event_view(row):
     return view
 
 
+def _attachment_view(row, review_id, version=None):
+    """附件关联行 → 对外视图（当前关联与快照行字段相同，通用）。
+
+    给定 version 时下载地址走版本快照鉴权路径（旧版本移除附件后仍可下载）；
+    否则走当前关联路径。
+    """
+    d = dict(row)
+    if version is None:
+        d["download_url"] = \
+            "/api/reviews/{}/attachments/{}/download".format(review_id, d["id"])
+    else:
+        d["download_url"] = \
+            "/api/reviews/{}/versions/{}/attachments/{}/download".format(
+                review_id, version, d["id"])
+    return d
+
+
+def _current_attachments(conn, review_id):
+    """当前附件关联（按 id 排序，稳定顺序）。"""
+    return [dict(r) for r in conn.execute(
+        "SELECT * FROM event_attachments WHERE review_id=? ORDER BY id",
+        (review_id,)).fetchall()]
+
+
+def _snapshot_attachment_rows(conn, review_id, version):
+    """某历史版本留存的附件关联（旧快照无记录 → 空列表）。"""
+    return [dict(r) for r in conn.execute(
+        "SELECT * FROM snapshot_attachments WHERE review_id=? AND review_version=?"
+        " ORDER BY id", (review_id, version)).fetchall()]
+
+
+def _attachment_kind(content_type):
+    return {
+        "image/png": "png",
+        "image/jpeg": "jpeg",
+        "application/pdf": "pdf",
+    }.get(content_type, "text")
+
+
 def init_db(db_path):
-    """启动时初始化数据库（建目录、建表、老库结构迁移）。"""
+    """启动时初始化数据库（建目录、建表、老库结构迁移、清理崩溃残留文件）。"""
     directory = os.path.dirname(os.path.abspath(db_path))
     os.makedirs(directory, exist_ok=True)
     conn = sqlite3.connect(db_path)
@@ -180,6 +280,15 @@ def init_db(db_path):
         conn.commit()
     finally:
         conn.close()
+    # 存储目录中的崩溃残留（.upload-* 临时文件、无任何引用的 blob）只在启动
+    # 与每次成功提交后清理；正常失败路径的临时文件在当次请求内即时删除。
+    root = attachments.ensure_storage_dir(db_path)
+    conn = connect(db_path)
+    try:
+        known = {r[0] for r in conn.execute("SELECT sha256 FROM blobs")}
+    finally:
+        conn.close()
+    attachments.sweep_orphan_files(root, known)
 
 
 def _migrate(conn):
@@ -265,6 +374,8 @@ def get_bundle(db_path, review_id):
             "SELECT * FROM events WHERE review_id=? ORDER BY id", (review_id,)).fetchall()]
         relations = [dict(r) for r in conn.execute(
             "SELECT * FROM relations WHERE review_id=? ORDER BY id", (review_id,)).fetchall()]
+        attachments = [_attachment_view(r, review_id)
+                       for r in _current_attachments(conn, review_id)]
         comp = conn.execute(
             "SELECT * FROM computations WHERE review_id=? ORDER BY id DESC LIMIT 1",
             (review_id,)).fetchone()
@@ -280,6 +391,7 @@ def get_bundle(db_path, review_id):
             "review": dict(review),
             "events": events,
             "relations": relations,
+            "attachments": attachments,
             "computation": computation,
         }
     finally:
@@ -303,6 +415,11 @@ def list_versions(db_path, review_id):
             (review_id,)).fetchall()
         snaps = {s["review_version"]: s for s in conn.execute(
             "SELECT * FROM snapshots WHERE review_id=?", (review_id,)).fetchall()}
+        attach_counts = {}
+        for r in conn.execute(
+                "SELECT review_version, COUNT(*) FROM snapshot_attachments"
+                " WHERE review_id=? GROUP BY review_version", (review_id,)).fetchall():
+            attach_counts[r[0]] = r[1]
         versions = []
         for c in comps:
             v = c["review_version"]
@@ -320,6 +437,7 @@ def list_versions(db_path, review_id):
                     "computed_at": c["computed_at"],
                     "reason": LEGACY_REASON,
                     "source_version": None,
+                    "attachment_count": 0,
                 })
             else:
                 versions.append({
@@ -335,6 +453,7 @@ def list_versions(db_path, review_id):
                     "title": snap["title"],
                     "source_version": snap["source_version"],
                     "source_review_id": snap["source_review_id"],
+                    "attachment_count": attach_counts.get(v, 0),
                 })
         return versions
     finally:
@@ -356,6 +475,12 @@ def _version_snapshot(conn, review_id, version):
         (review_id, version)).fetchone()
     if snap is None:
         raise LegacyVersion(version)
+    input_data = json.loads(snap["input_json"])
+    # 附件集合以 snapshot_attachments 表为准（与快照同一事务写入，含独立 id 供
+    # 下载鉴权）；旧快照无该表记录，视为空，绝不回填当前附件。
+    snapshot_attachments = _snapshot_attachment_rows(conn, review_id, version)
+    input_data["attachments"] = [
+        _attachment_view(r, review_id, version) for r in snapshot_attachments]
     return {
         "version": version,
         "state": "finalized" if snap["kind"] == "finalize" else "draft",
@@ -366,7 +491,8 @@ def _version_snapshot(conn, review_id, version):
         "created_at": snap["created_at"],
         "status": comp["status"],
         "computed_at": comp["computed_at"],
-        "input": json.loads(snap["input_json"]),
+        "input": input_data,
+        "attachment_count": len(snapshot_attachments),
         "result": json.loads(comp["result_json"]),
     }
 
@@ -505,6 +631,11 @@ def _save_version(conn, review_id, version, title, events, relations, kind, now=
 
     events/relations 为 compute 引擎所需的 live 行（含数字 id）；
     快照输入另外以 key 形式留存，供回看与恢复使用。
+
+    附件快照：把当前 event_attachments 关联（由调用方在事务内先行替换/复制/
+    裁剪完毕）整组复制到 snapshot_attachments，并冗余进
+    input_json["attachments"]。旧版本的附件集合因此冻结——之后移除当前附件、
+    删除事件都不影响旧版本下载。
     """
     now = now or _now()
     result = compute.compute(events, relations)
@@ -530,8 +661,31 @@ def _save_version(conn, review_id, version, title, events, relations, kind, now=
             item["origin"] = origin  # 并入事件：来源摘要随不可变快照留存
         snapshot_events.append(item)
     snapshot_relations = _snapshot_relations(relations, key_by_id)
-    input_json = json.dumps(
-        {"events": snapshot_events, "relations": snapshot_relations}, ensure_ascii=False)
+    # 当前附件关联整组固化为该版本的附件集合（上传时间/文件名/说明一并留存）
+    current_atts = _current_attachments(conn, review_id)
+    snapshot_atts = []
+    for a in current_atts:
+        conn.execute(
+            "INSERT INTO snapshot_attachments (review_id, review_version, event_uid,"
+            " blob_sha256, filename, description, content_type, size, uploaded_at)"
+            " VALUES (?,?,?,?,?,?,?,?,?)",
+            (review_id, version, a["event_uid"], a["blob_sha256"], a["filename"],
+             a["description"], a["content_type"], a["size"], a["uploaded_at"]))
+        snapshot_atts.append({
+            "event_uid": a["event_uid"],
+            "blob_sha256": a["blob_sha256"],
+            "filename": a["filename"],
+            "description": a["description"],
+            "content_type": a["content_type"],
+            "size": a["size"],
+            "uploaded_at": a["uploaded_at"],
+        })
+    input_payload = {
+        "events": snapshot_events,
+        "relations": snapshot_relations,
+        "attachments": snapshot_atts,
+    }
+    input_json = json.dumps(input_payload, ensure_ascii=False)
     conn.execute(
         "INSERT INTO snapshots (review_id, review_version, kind, title, input_json,"
         " source_version, source_review_id, created_at) VALUES (?,?,?,?,?,?,?,?)",
@@ -618,6 +772,52 @@ def _resolve_event_uids(conn, review_id, events):
         used.add(e["uid"])
 
 
+def _prune_dead_attachments(conn, review_id):
+    """删除事件已不存在的**当前**附件关联（普通保存删事件时调用）。
+
+    只影响当前关联与即将写入的新版本；snapshot_attachments 不动，旧版本
+    仍可下载原件。
+    """
+    conn.execute(
+        "DELETE FROM event_attachments WHERE review_id=? AND event_uid NOT IN"
+        " (SELECT uid FROM events WHERE review_id=?)", (review_id, review_id))
+
+
+def _unreferenced_blobs(conn):
+    """返回当前事务状态下没有任何当前/历史引用的 blob sha256 列表。"""
+    return [r[0] for r in conn.execute(
+        "SELECT sha256 FROM blobs WHERE sha256 NOT IN"
+        " (SELECT blob_sha256 FROM event_attachments)"
+        " AND sha256 NOT IN (SELECT blob_sha256 FROM snapshot_attachments)"
+    ).fetchall()]
+
+
+def _delete_blob_files(db_path, shas):
+    """提交成功后清理失去全部引用的 blob 文件；文件缺失/失败不影响数据。"""
+    if not shas:
+        return
+    root = attachments.storage_dir(db_path)
+    for sha in shas:
+        try:
+            attachments.blob_path(root, sha).unlink()
+        except OSError:
+            pass
+
+
+def _commit_and_gc(conn, db_path):
+    """提交事务并在成功后清理无引用 blob；失败回滚并向上抛出。
+
+    返回失去引用的 sha 列表（文件已删除）。
+    """
+    dead = _unreferenced_blobs(conn)
+    # 先在事务内移除将无引用的 blobs 行（若仍有引用，外键会阻止删除）
+    for sha in dead:
+        conn.execute("DELETE FROM blobs WHERE sha256=?", (sha,))
+    conn.commit()
+    _delete_blob_files(db_path, dead)
+    return dead
+
+
 def update_review(db_path, review_id, base_version, title, events, relations):
     """整体替换某复盘的输入并重新推算。base_version 过期则抛 VersionConflict。"""
     conn = connect(db_path)
@@ -631,6 +831,9 @@ def update_review(db_path, review_id, base_version, title, events, relations):
 
         _resolve_event_uids(conn, review_id, events)
         _replace_input(conn, review_id, events, relations)
+        # 附件关联跟随事件持续身份：改名/普通保存保留；事件被删除时，其当前
+        # 关联随之移除（旧快照中的关联不动）。
+        _prune_dead_attachments(conn, review_id)
         live_events, live_relations, _, _ = _current_input(conn, review_id)
 
         new_version = base_version + 1
@@ -641,7 +844,7 @@ def update_review(db_path, review_id, base_version, title, events, relations):
             (title, new_version, now, review_id))
         _save_version(conn, review_id, new_version, title, live_events, live_relations,
                       "save", now)
-        conn.commit()
+        _commit_and_gc(conn, db_path)
         return new_version
     except Exception:
         conn.rollback()
@@ -650,11 +853,31 @@ def update_review(db_path, review_id, base_version, title, events, relations):
         conn.close()
 
 
+def _replace_live_attachments_from_snapshot(conn, review_id, version):
+    """用某版本快照的附件集合重建当前关联（恢复历史版本时调用）。
+
+    以该版附件集合生成新草稿：event_attachments 整体替换为快照留存（上传时间、
+    文件名、说明一并沿用），随后由 _save_version 再固化进新版本快照。
+    """
+    conn.execute("DELETE FROM event_attachments WHERE review_id=?", (review_id,))
+    rows = conn.execute(
+        "SELECT event_uid, blob_sha256, filename, description, content_type, size,"
+        " uploaded_at FROM snapshot_attachments WHERE review_id=? AND review_version=?",
+        (review_id, version)).fetchall()
+    for r in rows:
+        conn.execute(
+            "INSERT INTO event_attachments (review_id, event_uid, blob_sha256, filename,"
+            " description, content_type, size, uploaded_at) VALUES (?,?,?,?,?,?,?,?)",
+            (review_id, r["event_uid"], r["blob_sha256"], r["filename"], r["description"],
+             r["content_type"], r["size"], r["uploaded_at"]))
+
+
 def restore_review(db_path, review_id, base_version, source_version):
     """把某历史版本的不可变输入恢复为当前复盘的新草稿版本，重新推算。
 
     旧版本及原版本都不被覆盖；版本过期抛 VersionConflict；来源版本缺少
-    完整输入快照（旧库历史版本）抛 LegacyVersion。
+    完整输入快照（旧库历史版本）抛 LegacyVersion。当前附件关联整体替换为
+    来源版本留存的附件集合（旧快照无附件即清空当前关联，绝不保留旧集合）。
     """
     conn = connect(db_path)
     try:
@@ -679,6 +902,8 @@ def restore_review(db_path, review_id, base_version, source_version):
 
         saved_input = json.loads(snap["input_json"])
         _replace_input(conn, review_id, saved_input["events"], saved_input["relations"])
+        # 以该版附件集合重建当前关联（旧快照无附件 → 当前为空）
+        _replace_live_attachments_from_snapshot(conn, review_id, source_version)
         live_events, live_relations, _, _ = _current_input(conn, review_id)
 
         new_version = base_version + 1
@@ -690,7 +915,7 @@ def restore_review(db_path, review_id, base_version, source_version):
             (title, new_version, now, review_id))
         _save_version(conn, review_id, new_version, title, live_events, live_relations,
                       "restore", now, source_version=source_version)
-        conn.commit()
+        _commit_and_gc(conn, db_path)
         return new_version
     except Exception:
         conn.rollback()
@@ -717,12 +942,23 @@ def _build_merge_plan(conn, target_id, source_id, source_version, selected_uids)
     except merge.MergeError as e:
         # 纯规划层的输入不合法统一转为 db 层的并入拒绝（HTTP 400，无部分写入）
         raise MergeRejected(str(e))
+    # 仅复制**入选事件**在来源版本快照中的附件关联（不参与 digest/推算）。
+    selected_set = {e.get("uid") for e in plan["copied_events"]}
+    plan["copied_attachments"] = [dict(r) for r in conn.execute(
+        "SELECT event_uid, blob_sha256, filename, description, content_type, size,"
+        " uploaded_at FROM snapshot_attachments"
+        " WHERE review_id=? AND review_version=? ORDER BY id",
+        (source_id, source_version)).fetchall()
+        if r["event_uid"] in selected_set]
     return plan, target, source, source_data
 
 
 def _preview_payload(plan, target, source, source_data, target_id, source_id, source_version):
     """由规划组装预览响应（只读，不改任何版本）。"""
     src_by_uid = {e["uid"]: e for e in source_data["input"]["events"]}
+    atts_by_uid = {}
+    for a in plan.get("copied_attachments", []):
+        atts_by_uid.setdefault(a["event_uid"], []).append(a)
 
     def copied_event_view(e):
         view = {
@@ -733,6 +969,15 @@ def _preview_payload(plan, target, source, source_data, target_id, source_id, so
             "duration_minutes": e.get("duration_minutes"),
             "note": e.get("note") or "",
             "timezone": e.get("timezone"),
+            # 入选事件随并入复制的附件（元信息；确认后只复制关联，文件共享）
+            "attachments": [{
+                "blob_sha256": a["blob_sha256"],
+                "filename": a["filename"],
+                "description": a["description"],
+                "content_type": a["content_type"],
+                "size": a["size"],
+                "uploaded_at": a["uploaded_at"],
+            } for a in atts_by_uid.get(e.get("uid"), [])],
         }
         # 预览即展示该事件确认后的来源摘要（只读；不参与 digest/推算）。
         # 始终指向**直接来源**版本中的事件身份：即使来源事件本身也是更早
@@ -752,6 +997,15 @@ def _preview_payload(plan, target, source, source_data, target_id, source_id, so
             "min_gap_minutes": r["min_gap_minutes"],
             "max_gap_minutes": r["max_gap_minutes"],
         })
+    copied_attachments = [{
+        "event_uid": a["event_uid"],
+        "blob_sha256": a["blob_sha256"],
+        "filename": a["filename"],
+        "description": a["description"],
+        "content_type": a["content_type"],
+        "size": a["size"],
+        "uploaded_at": a["uploaded_at"],
+    } for a in plan.get("copied_attachments", [])]
     return {
         "target": {
             "review_id": target_id,
@@ -768,6 +1022,8 @@ def _preview_payload(plan, target, source, source_data, target_id, source_id, so
         },
         "copied_events": [copied_event_view(e) for e in plan["copied_events"]],
         "copied_relations": copied_relations,
+        "copied_attachments": copied_attachments,
+        "copied_attachment_count": len(copied_attachments),
         "result": plan["result"],
         "digest": plan["digest"],
     }
@@ -835,12 +1091,37 @@ def merge_into_review(db_path, target_id, source_id, source_version,
         # 服务端注入点——把来源摘要重新挂到复制事件上。
         copied_origins = {e["key"]: e.get("origin") for e in events
                           if e.get("key", "").startswith("m_") and e.get("origin")}
+        # save_payload 中复制事件顺序与 plan["copied_events"] 一致，临时 key 为
+        # m_<i>_<来源uid前8位>；按同一顺序建立 来源uid → 临时key 的映射。
+        copied_keys = [e["key"] for e in events
+                       if str(e.get("key", "")).startswith("m_")]
+        src_uid_to_key = {
+            e["uid"]: copied_keys[i]
+            for i, e in enumerate(plan["copied_events"]) if i < len(copied_keys)}
         _resolve_event_uids(conn, target_id, events)
         for e in events:
             origin = copied_origins.get(e.get("key"))
             if origin is not None:
                 e["origin"] = origin  # 新持续身份与来源摘要绑定
+        # _resolve_event_uids 把 m_ key 事件的 uid 换发为目标的全新值
+        new_uid_by_key = {e["key"]: e["uid"] for e in events
+                          if str(e.get("key", "")).startswith("m_")}
+        src_uid_to_new_uid = {
+            src: new_uid_by_key[key] for src, key in src_uid_to_key.items()
+            if key in new_uid_by_key}
         _replace_input(conn, target_id, events, relations)
+        # 仅复制入选事件的附件关联到复制事件的**全新 uid**：文件按内容寻址共享，
+        # 来源（或整个来源复盘）随后删除，目标的当前关联与新快照仍引用同一 blob，
+        # GC 不会清理。来源历史不回读、不改写。
+        for a in plan.get("copied_attachments", []):
+            new_uid = src_uid_to_new_uid.get(a["event_uid"])
+            if new_uid is None:
+                continue  # 理论不会发生：附件只属于 plan 中的入选事件
+            conn.execute(
+                "INSERT INTO event_attachments (review_id, event_uid, blob_sha256, filename,"
+                " description, content_type, size, uploaded_at) VALUES (?,?,?,?,?,?,?,?)",
+                (target_id, new_uid, a["blob_sha256"], a["filename"], a["description"],
+                 a["content_type"], a["size"], a["uploaded_at"]))
         live_events, live_relations, _, _ = _current_input(conn, target_id)
 
         new_version = base_version + 1
@@ -852,7 +1133,7 @@ def merge_into_review(db_path, target_id, source_id, source_version,
             (title, new_version, now, target_id))
         _save_version(conn, target_id, new_version, title, live_events, live_relations,
                       "merge", now, source_version=source_version, source_review_id=source_id)
-        conn.commit()
+        _commit_and_gc(conn, db_path)
         return new_version
     except Exception:
         conn.rollback()
@@ -892,7 +1173,7 @@ def finalize_review(db_path, review_id, base_version):
             (new_version, now, review_id))
         _save_version(conn, review_id, new_version, row["title"], live_events, live_relations,
                       "finalize", now, source_version=base_version)
-        conn.commit()
+        _commit_and_gc(conn, db_path)
     except Exception:
         conn.rollback()
         raise
@@ -903,9 +1184,239 @@ def finalize_review(db_path, review_id, base_version):
 def delete_review(db_path, review_id):
     conn = connect(db_path)
     try:
+        # ON DELETE CASCADE 一并删除 events/relations/computations/snapshots 及
+        # 该复盘的当前/快照附件关联；随后清理失去全部引用的 blob 文件。
         cur = conn.execute("DELETE FROM reviews WHERE id=?", (review_id,))
-        conn.commit()
         if cur.rowcount == 0:
+            conn.rollback()
             raise NotFound(review_id)
+        _commit_and_gc(conn, db_path)
+    except Exception:
+        conn.rollback()
+        raise
+    finally:
+        conn.close()
+
+
+# ------------------------------------------------------------- 事故现场附件
+
+MAX_ATTACHMENTS_PER_EVENT = 100
+MAX_ATTACHMENTS_PER_REVIEW = 1000
+
+
+def _event_exists(conn, review_id, event_uid):
+    """事件持续身份必须属于该复盘的当前 live 事件（附件只能挂在已保存事件上）。"""
+    return conn.execute(
+        "SELECT 1 FROM events WHERE review_id=? AND uid=?", (review_id, event_uid)
+    ).fetchone() is not None
+
+
+def add_event_attachment(db_path, review_id, base_version, event_uid, filename,
+                         description, content_type, size, sha256, staged_path):
+    """把已通过内容校验的临时附件原子入库并挂到事件持续身份，另存新版本。
+
+    与所有写版本操作共用同一乐观锁：base_version 过期抛 VersionConflict（409，
+    不产生版本也不留文件）；事件不属于该复盘/尚未保存抛 AttachmentRejected。
+
+    磁盘文件在事务内由临时名 os.replace 为内容哈希：内容已存在则删除临时文件；
+    事务失败回滚时，新写入的哈希文件由调用方在异常路径清理（无残留），
+    启动扫描兜底崩溃窗口。
+
+    返回 (new_version, 新关联视图 dict)。
+    """
+    conn = connect(db_path)
+    stored_new = False
+    committed = False
+    try:
+        conn.execute("BEGIN IMMEDIATE")
+        row = conn.execute("SELECT version FROM reviews WHERE id=?", (review_id,)).fetchone()
+        if row is None:
+            raise NotFound(review_id)
+        if row["version"] != base_version:
+            raise VersionConflict(row["version"])
+        if not _event_exists(conn, review_id, event_uid):
+            raise AttachmentRejected(
+                "事件不存在或尚未保存，请先保存该事件后再上传附件")
+        count = conn.execute(
+            "SELECT COUNT(*) FROM event_attachments WHERE review_id=?",
+            (review_id,)).fetchone()[0]
+        if count >= MAX_ATTACHMENTS_PER_REVIEW:
+            raise AttachmentRejected(
+                "单个复盘附件数量已达上限（{} 个）".format(MAX_ATTACHMENTS_PER_REVIEW))
+        event_count = conn.execute(
+            "SELECT COUNT(*) FROM event_attachments WHERE review_id=? AND event_uid=?",
+            (review_id, event_uid)).fetchone()[0]
+        if event_count >= MAX_ATTACHMENTS_PER_EVENT:
+            raise AttachmentRejected(
+                "单个事件附件数量已达上限（{} 个）".format(MAX_ATTACHMENTS_PER_EVENT))
+
+        root = attachments.storage_dir(db_path)
+        blob_exists = conn.execute(
+            "SELECT 1 FROM blobs WHERE sha256=?", (sha256,)).fetchone() is not None
+        if not blob_exists:
+            # 原子改名入库；同一内容并发上传时若文件已落盘，按已存在处理
+            stored_new = attachments.store_blob(root, sha256, staged_path)
+            conn.execute(
+                "INSERT INTO blobs (sha256, size, kind, created_at) VALUES (?,?,?,?)",
+                (sha256, size, _attachment_kind(content_type), _now()))
+        else:
+            # 内容已存在：store_blob 不会被调用，临时文件由调用方 finally 清理
+            try:
+                os.unlink(staged_path)
+            except OSError:
+                pass
+
+        now = _now()
+        cur = conn.execute(
+            "INSERT INTO event_attachments (review_id, event_uid, blob_sha256, filename,"
+            " description, content_type, size, uploaded_at) VALUES (?,?,?,?,?,?,?,?)",
+            (review_id, event_uid, sha256, filename, description, content_type, size, now))
+        attachment_id = cur.lastrowid
+
+        # 附件变更必须产生新版本：沿用当前输入与附件关联重算并写不可变快照
+        title = conn.execute("SELECT title FROM reviews WHERE id=?", (review_id,)).fetchone()["title"]
+        live_events, live_relations, _, _ = _current_input(conn, review_id)
+        new_version = base_version + 1
+        conn.execute(
+            "UPDATE reviews SET version=?, updated_at=? WHERE id=?",
+            (new_version, now, review_id))
+        _save_version(conn, review_id, new_version, title, live_events, live_relations,
+                      "attachment", now)
+        _commit_and_gc(conn, db_path)
+        committed = True
+        view = {
+            "id": attachment_id,
+            "review_id": review_id,
+            "event_uid": event_uid,
+            "blob_sha256": sha256,
+            "filename": filename,
+            "description": description,
+            "content_type": content_type,
+            "size": size,
+            "uploaded_at": now,
+            "download_url": "/api/reviews/{}/attachments/{}/download".format(
+                review_id, attachment_id),
+        }
+        return new_version, view
+    except Exception:
+        conn.rollback()
+        if not committed and stored_new:
+            # 事务失败（如并发去重、版本冲突的极小窗口）：仅当该 blob 行确实
+            # 未被任何（并发成功的）事务写入时才清理文件，避免误删他人内容。
+            check = connect(db_path)
+            try:
+                still_there = check.execute(
+                    "SELECT 1 FROM blobs WHERE sha256=?", (sha256,)).fetchone()
+            finally:
+                check.close()
+            if still_there is None:
+                try:
+                    attachments.blob_path(attachments.storage_dir(db_path), sha256).unlink()
+                except OSError:
+                    pass
+        raise
+    finally:
+        conn.close()
+        # store_blob 成功改走哈希路径后，原临时路径已不存在；内容已存在时上面已删
+        try:
+            os.unlink(staged_path)
+        except OSError:
+            pass
+
+
+def remove_event_attachment(db_path, review_id, base_version, attachment_id):
+    """移除当前附件关联并另存新版本。
+
+    只删除 event_attachments 当前关联；snapshot_attachments 不动——旧版本仍可
+    下载原件。若这是 blob 的最后一个当前/历史引用，提交后清理文件。
+    """
+    conn = connect(db_path)
+    try:
+        conn.execute("BEGIN IMMEDIATE")
+        row = conn.execute("SELECT version FROM reviews WHERE id=?", (review_id,)).fetchone()
+        if row is None:
+            raise NotFound(review_id)
+        if row["version"] != base_version:
+            raise VersionConflict(row["version"])
+        cur = conn.execute(
+            "DELETE FROM event_attachments WHERE id=? AND review_id=?",
+            (attachment_id, review_id))
+        if cur.rowcount == 0:
+            raise AttachmentNotFound(attachment_id)
+
+        now = _now()
+        title = conn.execute("SELECT title FROM reviews WHERE id=?", (review_id,)).fetchone()["title"]
+        live_events, live_relations, _, _ = _current_input(conn, review_id)
+        new_version = base_version + 1
+        conn.execute(
+            "UPDATE reviews SET version=?, updated_at=? WHERE id=?",
+            (new_version, now, review_id))
+        _save_version(conn, review_id, new_version, title, live_events, live_relations,
+                      "attachment", now)
+        _commit_and_gc(conn, db_path)
+        return new_version
+    except Exception:
+        conn.rollback()
+        raise
+    finally:
+        conn.close()
+
+
+def get_current_attachment(db_path, review_id, attachment_id):
+    """按当前关联定位附件：(磁盘路径, 关联行 dict, blob 行)。
+
+    仅当该关联属于该复盘且文件本体存在时返回；否则 AttachmentNotFound。
+    """
+    conn = connect(db_path)
+    try:
+        if conn.execute("SELECT id FROM reviews WHERE id=?", (review_id,)).fetchone() is None:
+            raise NotFound(review_id)
+        row = conn.execute(
+            "SELECT * FROM event_attachments WHERE id=? AND review_id=?",
+            (attachment_id, review_id)).fetchone()
+        if row is None:
+            raise AttachmentNotFound(attachment_id)
+        blob = conn.execute("SELECT * FROM blobs WHERE sha256=?",
+                            (row["blob_sha256"],)).fetchone()
+        if blob is None:
+            raise AttachmentNotFound(attachment_id)
+        path = attachments.blob_path(attachments.storage_dir(db_path), row["blob_sha256"])
+        if not path.is_file():
+            raise AttachmentNotFound(attachment_id)
+        return path, dict(row), dict(blob)
+    finally:
+        conn.close()
+
+
+def get_version_attachment(db_path, review_id, version, attachment_id):
+    """按历史版本快照定位附件：(磁盘路径, 快照关联行 dict)。
+
+    仅当该快照关联属于该复盘该版本且文件本体存在时返回——附件已从当前移除后，
+    旧版本仍经此路径下载原件。复盘/版本不存在按 NotFound/VersionNotFound 抛出。
+    """
+    conn = connect(db_path)
+    try:
+        review = conn.execute("SELECT id FROM reviews WHERE id=?", (review_id,)).fetchone()
+        if review is None:
+            raise NotFound(review_id)
+        snap = conn.execute(
+            "SELECT 1 FROM snapshots WHERE review_id=? AND review_version=?",
+            (review_id, version)).fetchone()
+        if snap is None:
+            comp = conn.execute(
+                "SELECT 1 FROM computations WHERE review_id=? AND review_version=?",
+                (review_id, version)).fetchone()
+            if comp is not None:
+                raise LegacyVersion(version)
+            raise VersionNotFound(version)
+        row = conn.execute(
+            "SELECT * FROM snapshot_attachments WHERE id=? AND review_id=? AND review_version=?",
+            (attachment_id, review_id, version)).fetchone()
+        if row is None:
+            raise AttachmentNotFound(attachment_id)
+        path = attachments.blob_path(attachments.storage_dir(db_path), row["blob_sha256"])
+        if not path.is_file():
+            raise AttachmentNotFound(attachment_id)
+        return path, dict(row)
     finally:
         conn.close()
